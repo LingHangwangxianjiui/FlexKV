@@ -1,3 +1,35 @@
+# ==============================================================================
+# flexkv/common/transfer.py —— 全系统的"中间表示（IR）"层
+# ------------------------------------------------------------------------------
+# 本文件只定义数据结构，不做任何实际的数据搬运。它是控制面与数据面之间的契约，
+# 也是阅读整个 FlexKV 项目最应该先读的文件。
+#
+# 核心概念只有三个，理解它们就能读懂后续所有代码：
+#
+#   1. TransferType —— 一条"通路"的类型，如 H2D、DISK2H。命名规则是 <源>2<目的>，
+#      其中 H=Host(CPU 内存)、D=Device(GPU 显存)、DISK=本地 SSD、REMOTE=远端存储。
+#   2. TransferOp —— 一个传输操作，即 DAG 中的一个节点，只描述"把哪些 block
+#      从哪搬到哪"，本身不含任何执行逻辑。
+#   3. TransferOpGraph —— 由若干 TransferOp 组成的有向无环图（DAG），
+#      节点间的依赖表达执行顺序（例如"必须先 DISK2H 再 H2D"）。
+#
+# 数据是怎么流转的（这是整个 FlexKV 的分层精髓）：
+#
+#     控制面（cache/cache_engine.py 等）          数据面（transfer/ 等）
+#   ┌──────────────────────────────┐          ┌──────────────────────────┐
+#   │ 决策：从哪搬到哪、搬哪些 block │  产出图  │ 执行：调度 DAG、派发 op   │
+#   │ 产出 TransferOpGraph         │ ───────→ │ 把 op 交给 Worker 进程搬  │
+#   └──────────────────────────────┘          └──────────────────────────┘
+#
+#   控制面只"造图"，数据面只"执行图"，两者通过本文件的图结构彻底解耦。
+#   所以改动传输逻辑时，先判断你改的是"造图"还是"执行图"，再看对应的模块。
+#
+# 建议阅读顺序：
+#   DeviceType -> TransferType -> TransferOpStatus -> TransferOp
+#   -> TransferOpGraph（及其 add_dependency / take_ready_ops / set_gpu_blocks）
+#   -> merge_to_batch_graph（较复杂，建议第二遍再读）
+# ==============================================================================
+
 import threading
 from dataclasses import dataclass, field, replace
 from enum import Enum, IntEnum
@@ -18,6 +50,17 @@ class WorkerKey:
 
 @dataclass(frozen=True)
 class CompletedOp:
+    """数据面回传给控制面的"完成通知"，经进程间队列传递，所以是不可变 dataclass。
+
+    约定：op_id == -1 表示这是一条**图级别**的消息而非某个具体 op 的完成通知——
+    此时用 failed 区分是"整图成功完成"还是"整图因某 op 失败而终止"
+    （见 is_graph_completed / is_graph_failed）。
+
+    block_results 记录了每个 block 的成败，供支持"部分成功"的后端
+    （如 Mooncake）使用；为 None 时沿用传统的"全成功或全失败"语义。
+    """
+    # 注意：graph_id / op_id 是两个无默认值的必填字段，必须排在带默认值的字段之前，
+    # 否则 dataclass 会报 "non-default argument follows default argument"。
     graph_id: int
     op_id: int
     # Transfer metrics fields (populated when op completes, for post-completion metrics)
@@ -89,14 +132,31 @@ def invoke_op_callback(callback: Callable,
 
 
 class DeviceType(IntEnum):
-    CPU = 0
-    GPU = 1
-    SSD = 2
-    REMOTE = 3
-    PEERCPU = 4
-    PEERSSD = 5
+    """存储层级枚举：GPU 显存 + 三级缓存 + 分布式对端，共 6 种设备。
+
+    命名里的 PEER* 表示"其他节点上的同层缓存"，只有在开启分布式 KV 复用
+    （enable_p2p_cpu / enable_p2p_ssd，且编译时带 FLEXKV_ENABLE_P2P=1）时才会用到。
+    """
+    CPU = 0        # 主机内存，第一级外部缓存（可选配 HugePage）
+    GPU = 1        # GPU 显存，推理引擎直接读写的 KV Cache
+    SSD = 2        # 本地 SSD，第二级持久化缓存
+    REMOTE = 3     # 远端存储，第三级（如 Mooncake Store / 云存储）
+    PEERCPU = 4    # 其他节点的 CPU 内存
+    PEERSSD = 5    # 其他节点的 SSD
+
 
 class TransferType(Enum):
+    """传输通路类型，命名规则为 <源>2<目的>（2 即英文 to 的谐音）。
+
+    缩写含义：H = Host（CPU 内存）、D = Device（GPU 显存）、
+              DISK = 本地 SSD、REMOTE = 远端存储、PEER = 其他节点。
+
+    例如 H2D 表示"CPU 内存 -> GPU 显存"，DISK2H 表示"SSD -> CPU 内存"。
+
+    重要：一个 TransferOp 只能表示"一跳"。多级中转（如 SSD -> CPU -> GPU）
+    不是靠单个 op 完成，而是把 DISK2H 和 H2D 两个 op 串成 DAG，
+    用 add_dependency() 表达先后顺序。这样数据面可以流水化执行。
+    """
     H2D    = "H2D"
     D2H    = "D2H"
     DISK2H = "DISK2H"
@@ -126,12 +186,34 @@ class PartitionBlockType(Enum):
     SEQUENTIAL = 1
 
 class TransferOpStatus(Enum):
-    PENDING = 0
-    RUNNING = 1
-    COMPLETED = 2
+    """单个 op 的生命周期状态，由数据面的调度器维护，控制面不感知。
+
+    状态迁移：PENDING --(前驱全部完成、被调度器取走)--> RUNNING --(传输完成)--> COMPLETED
+    """
+    PENDING = 0    # 等待前驱依赖完成
+    RUNNING = 1    # 已派发给 Worker 进程，正在传输
+    COMPLETED = 2  # 传输完成，其后继可被解锁
+
 
 @dataclass
 class TransferOp:
+    """DAG 中的一个传输节点：把 src_block_ids 里的 block 搬到 dst_block_ids。
+
+    几个容易踩坑的设计点：
+
+    * op_id 由类级计数器在 __post_init__ 里自动分配（加锁保证线程安全），
+      全局单调递增且唯一。数据面完成回传时用 (graph_id, op_id) 定位 op。
+    * predecessors 会随执行**动态减少**（每完成一个前驱就移除一个），
+      所以它只反映"还剩几个未完成的前驱"；successors 则始终保持完整，
+      mark_completed() 靠它反向查找该解锁谁。
+    * block id 是"逻辑槽位号"而非内存地址。真正的地址要在 Worker 进程内
+      由 StorageEngine 的 handle 解析（跨进程内存句柄见 common/memory_handle.py）。
+    * GPU 侧的 block id 在建图时通常是空的，要等提交前才由
+      TransferOpGraph.set_gpu_blocks() 晚绑定——因为 GPU 显存槽位得等推理
+      引擎的调度器分配完 slot_mapping 才能确定。
+    * is_swa=True 的 op 属于 SWA（滑动窗口注意力）独立缓存池，有自己的
+      slot id 空间，会被路由到专门的 SWA worker，绝不能和全量 KV 混用。
+    """
     _next_op_id: ClassVar[int] = 0
     _lock: ClassVar[threading.Lock] = threading.Lock()
 
@@ -250,6 +332,25 @@ class LayerwiseTransferOp(TransferOp):
 
 
 class TransferOpGraph:
+    """一次传输任务的 DAG，是控制面交给数据面的唯一交付物。
+
+    调度语义（数据面正是按这套约定执行的）：
+
+    * add_transfer_op() 加入的 op 默认进入 _ready_ops，表示可立即执行；
+      若该 op 涉及 GPU，还会被记入 _gpu_transfer_op_id 以便后续晚绑定。
+    * add_dependency(succ, pred) 建立依赖，并把 succ 从 _ready_ops 中移除；
+      只有当 pred 完成、succ 的 predecessors 被清空后，succ 才会重新变为 ready。
+    * take_ready_ops() 由数据面调度器循环调用，取出本轮可执行的一批 op，
+      顺带把"前驱已全部完成"的后继 op 提升为 RUNNING。
+    * mark_completed(op_id) 在完成回传时调用，从各后继的 predecessors 中
+      移除自己，从而解锁后继。
+
+    关于 GPU block 的晚绑定（late bind）：
+      建图时 GPU 侧的 block id 通常还是空数组，因为推理引擎尚未分配显存槽位。
+      提交前用 set_gpu_blocks() / set_swa_gpu_blocks() 把真实 GPU block id
+      填进去；图需要复用时，用 clear_gpu_blocks() 清空后再重新绑定。
+      这个"建图时留空、提交前填实"的机制是本文件最反直觉也最关键的设计。
+    """
     _next_graph_id = 0
     _lock = threading.Lock()
 
@@ -322,14 +423,23 @@ class TransferOpGraph:
         self._ready_ops.add(op.op_id)
 
     def add_dependency(self, successor_op_id: int, predecessor_op_id: int) -> None:
-        """successor_op_id depends on predecessor_op_id"""
+        """声明 successor_op_id 依赖 predecessor_op_id（即 pred 必须先完成）。
+
+        注意这里会把 successor 从 _ready_ops 中移除：加了依赖就意味着它
+        不再能"立即执行"，要等 take_ready_ops() 发现它的 predecessors 空了
+        才会被重新放回可执行集合。
+        """
         assert successor_op_id in self._op_map and predecessor_op_id in self._op_map
         self._op_map[successor_op_id].predecessors.add(predecessor_op_id)
         self._op_map[predecessor_op_id].successors.add(successor_op_id)
         self._ready_ops.discard(successor_op_id)
 
     def mark_completed(self, op_id: int) -> None:
-        """mark an op as completed"""
+        """把一个 op 标记为 COMPLETED，并从它所有后继的 predecessors 中摘除自己。
+
+        这是 DAG 推进的关键一步：后继的 predecessors 变空后，
+        就会在下一轮 take_ready_ops() 中被提升为 RUNNING 并返回给调度器。
+        """
         if op_id in self._op_map:
             assert self._op_map[op_id].status == TransferOpStatus.RUNNING
             self._op_map[op_id].status = TransferOpStatus.COMPLETED
@@ -338,7 +448,15 @@ class TransferOpGraph:
                 self._op_map[successor_id].predecessors.remove(op_id)
 
     def take_ready_ops(self) -> List[int]:
-        """get a list of op ids that are ready to execute"""
+        """取出本轮可执行的 op id 列表，并把它们的状态置为 RUNNING。
+
+        由数据面调度器（transfer/scheduler.py -> transfer_engine.py 的调度循环）
+        反复调用。这里同时完成两件事：
+          1. 把 _ready_ops 中已 COMPLETED 的 op 清理掉，并检查其后继是否已
+             满足"全部前驱完成"的条件，满足则一并作为本轮可执行项返回；
+          2. 把仍为 PENDING 的 ready op 直接提升为 RUNNING 返回。
+        返回的同时这些 op 会被标记为 RUNNING，避免下一轮被重复取出。
+        """
         ready_ops = []
         to_remove = []
         to_add = []
@@ -758,6 +876,12 @@ def _add_batch_sink(graph: TransferOpGraph, terminals: List[int],
     return sink.op_id
 
 
+# ------------------------------------------------------------------------------
+# 阅读提示：merge_to_batch_graph 是全文件最复杂的函数，建议**第二遍**再读。
+# 它的作用是把多个请求的图"融合"成一张批图，以减少跨进程调度开销：
+# 把 N 个请求各自的小 op 按 TransferType 分桶、合并成一个大 op。
+# 第一遍只需知道它的输入输出契约（见下方 docstring），不必深究分支细节。
+# ------------------------------------------------------------------------------
 def merge_to_batch_graph(batch_id: int,
                          transfer_graphs: List[TransferOpGraph],
                          task_end_op_ids: List[int],
