@@ -1,7 +1,14 @@
+# 准备依赖 → 配置 CMake → 编译 C++/第三方库 → 把 .so 动态库放到 Python 包 → 安装/打包 FlexKV Python 包
 #!/bin/bash
+# 使用/bin/bash执行这个脚本，执行 ./build.sh Linux会根据这一行找到bash
+
+# 任何命令返回非 0 状态码，就立即退出脚本
 set -e
 
+# Set project root directory pwd是当前目录
 PROJECT_ROOT=$(pwd)
+
+# Set default build type to debug 默认使用debug ./build.sh 默认等价于 ./build.sh --debug
 BUILD_TYPE="debug"  # Default to debug build
 
 # Parse command line arguments

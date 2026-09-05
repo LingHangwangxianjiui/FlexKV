@@ -17,6 +17,7 @@ from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import StorageHandle, AccessHandleType, KVCacheLayout, KVCacheLayoutType
 from flexkv.common.debug import flexkv_logger
 
+# TODO: add more allocators
 
 class BaseStorageAllocator(ABC):
     @classmethod
