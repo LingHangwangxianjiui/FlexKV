@@ -12,6 +12,41 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# ==============================================================================
+# 本文件职责：数据面的调度中枢。把控制面产出的传输 DAG(TransferOpGraph) 拆成一个个
+# op，派发给具体的 Worker 子进程执行，并把完成情况汇聚回上层。
+#
+# 在系统链路中的位置：
+#   KVManager -> KVTaskEngine -> GlobalCacheEngine(控制面：查索引、判命中、决定
+#     "搬哪些 block / 走哪条通路"，产出 TransferOpGraph)
+#     -> 【本文件 TransferEngine】(数据面：决定"派给哪个 worker、何时算搬完")
+#       -> Worker(真正搬字节的独立进程) -> c_ext(csrc/bindings.cpp)
+#
+# 与控制面 GlobalCacheEngine 的分工（务必分清）：
+#   控制面：认识 KV block 的语义，负责"搬什么"，编完 DAG 就撒手。
+#   本文件：不认识 KV block，只认识 op / graph / transfer_type，负责"谁来搬"。
+#   一句话：控制面决策，本文件执行调度。
+#
+# 核心内容速查：
+#   - TransferEngine.__init__           : 建三个队列、pin_buffer、shutdown pipe
+#   - TransferEngine._init_workers      : 按 TP/GDS/SWA/Layerwise 拓扑创建 worker
+#   - TransferEngine._scheduler_loop    : 单线程 selectors 事件循环，本文件的心脏
+#   - TransferEngine._assign_op_to_worker      : op -> worker 的路由（含 PP fan-out）
+#   - TransferEngine.submit_transfer_graph     : 上层提交 DAG 的入口（非阻塞）
+#   - TransferEngine.get_completed_graphs_and_ops : 上层回收完成通知的出口
+#
+# 阅读提示：
+#   * 先读 flexkv/transfer/scheduler.py（本文件调用它做 DAG 就绪判定），再读本文件。
+#     二者是上下游而非替代关系：scheduler.py 管"DAG 里哪些 op 已就绪可调度"，
+#     本文件管"就绪的 op 派给哪个 worker 进程、完成事件怎么回收"。
+#   * 跨进程通信全靠三个 mp.Queue + 每个 worker 一条 Pipe：
+#       task_queue         : 上层 -> 调度线程（提交 DAG，支持 list 批量）
+#       finished_ops_queue : worker -> 调度线程（op 完成/失败回报，多 worker 共享）
+#       completed_queue    : 调度线程 -> 上层（CompletedOp 完成通知）
+#     用 mp.Queue 而非 queue.Queue，是因为要拿它的 _reader fd 注册进 selectors。
+#   * 一个 op 往往会"扇出"成多个 replica（PP 流水并行的每个 stage 一份），
+#     靠 op.pending_count 归零判定整个 op 完成 —— 这是理解本文件的关键。
+# ==============================================================================
 import queue
 import threading
 import time
@@ -62,6 +97,16 @@ def register_op_to_buffer(op: TransferOp, pin_buffer: SharedOpPool) -> None:
 
     Device type prefixes prevent hash collisions when different device types
     use the same block ID values (e.g., CPU block 0 vs SSD block 0).
+
+    中文补充：给 op 的 src/dst block id 在共享 op_buffer(SharedOpPool) 里申请槽位，
+    槽位号写回 op.src_slot_id / op.dst_slot_id。op 跨进程只传 block id 数组，
+    真正的传输元数据放在共享内存槽里由 worker 按 slot_id 自取，省掉每 op 一次
+    大数组 pickle 拷贝。
+    transfer_type_to_devices 里的魔法数字是设备类型编号（1=GPU 2=CPU 3=SSD
+    4=REMOTE 5=PEER_CPU 6=PEER_SSD），作为前缀参与槽位哈希，防止"CPU block 0
+    与 SSD block 0"这类同号不同设备的 block 撞进同一个槽 —— 撞槽的表现是
+    数据被写到别的 op 的 buffer 里，极难排查。
+    LAYERWISE op 直接返回不占槽：它由 LayerwiseTransferWorker 自己管理数据。
     """
     if op.transfer_type == TransferType.LAYERWISE:
         return
@@ -88,6 +133,14 @@ def register_op_to_buffer(op: TransferOp, pin_buffer: SharedOpPool) -> None:
     op.dst_slot_id = pin_buffer.allocate_slot(op.dst_block_ids, device_type_prefix=dst_device)
 
 def free_op_from_buffer(op: TransferOp, pin_buffer: SharedOpPool) -> None:
+    """释放 register_op_to_buffer 申请的槽位（register 的逆操作）。
+
+    槽位号 -1 表示"没申请过"（未注册或 LAYERWISE），跳过即可，所以本函数对
+    重复释放是安全的。
+    约定：每个 op 要么在调度线程注册并由它释放（单 worker 通路），要么由
+    _assign_*_to_worker 给每个 replica 各注册一份、各释放一份（PP fan-out 通路），
+    两条路不能混用，否则会双重释放或漏释放。见 _op_buffer_registered_here。
+    """
     if op.src_slot_id != -1:
         pin_buffer.free_slot(op.src_slot_id)
     if op.dst_slot_id != -1:
@@ -100,6 +153,12 @@ def _te_bounded_cuda_sync(timeout_s: float) -> None:
     Runs the sync in a daemon thread so a wedged GPU cannot prevent
     TransferEngine.shutdown from returning. Failure / timeout is logged
     but not raised — this is called from the shutdown finally.
+
+    中文补充：为什么不直接 torch.cuda.synchronize()——若 GPU 已经"卡死"，
+    同步会永久阻塞，导致 TM 进程退不掉，只能靠父进程 SIGKILL。这里放进
+    daemon 线程 + wait(timeout) 设上限：超时就放弃等待继续往下走。
+    线程是 daemon 的，所以即使它永远卡住也不会拖住解释器退出。
+    失败/超时只记日志不抛异常，因为调用点在 shutdown 的 finally 里。
     """
     if not (torch.cuda.is_available() and torch.cuda.is_initialized()):
         return
@@ -130,6 +189,44 @@ def _te_bounded_cuda_sync(timeout_s: float) -> None:
         )
 
 class TransferEngine:
+    """数据面的调度中枢（整体定位见本文件头部注释）。
+
+    在链路中的职责：承上启下。
+      向上：控制面（GlobalCacheEngine / KVTaskEngine）通过 submit_transfer_graph
+            丢进一张 TransferOpGraph，通过 get_completed_graphs_and_ops 取走
+            CompletedOp 完成通知。本文件不认识 KV block 语义，只认 op/graph。
+      向下：持有一批 WorkerHandle（每个 = 一个 worker 子进程 + 一条 Pipe），
+            按 op.transfer_type 与集群拓扑把它们分配给对应 worker。
+
+    关键设计：
+      1. 单线程事件循环。_scheduler_loop 是唯一修改调度状态的线程，所有共享
+         状态（op_id_to_op、_child_to_parent_op_id、scheduler、pin_buffer）
+         都由它独占读写，因此内部完全不加锁；对外只通过 mp.Queue 交互。
+      2. 两级映射决定"派给谁"：
+           _worker_map     : TransferType -> WorkerHandle
+                             或 Dict[WorkerKey, WorkerHandle]
+           _swa_worker_map : 同上，SWA（滑动窗口）独立缓存池专用
+         值为 dict 表示"按 WorkerKey(dp_client_id, pp_rank) 分桶"，通常意味着
+         这条通路要做 PP fan-out；值为单个 handle 表示全局单例 worker
+         （CPU<->SSD / CPU<->Remote 这类与 GPU 拓扑无关的通路）。
+      3. 完成判定用 op.pending_count 归零，而不是"收到一次回报"：一个 op 扇出
+         N 个 replica 就要收 N 次回报，保证 PP 各 stage 的完成是原子的。
+
+    生命周期：start()（建 worker + 拉起调度线程）-> 业务期（submit / get）
+    -> shutdown()（停线程 + 并行停 worker）。
+    """
+
+    # 中文：只做"建状态"，不建 worker（worker 在 start()/_init_workers 里才 spawn）。
+    # 这里建好的几样东西贯穿整个生命周期：
+    #   * mp_ctx = spawn：必须用 spawn 而非 fork —— worker 进程要建自己的 CUDA
+    #     上下文，fork 会把父进程的 CUDA 状态一起复制过去，极易死锁/崩溃。
+    #   * 三个 mp.Queue：task_queue（上层->调度线程）、finished_ops_queue
+    #     （worker->调度线程，所有 worker 共用）、completed_queue（调度线程->上层）。
+    #     用 mp.Queue 而非 queue.Queue 是为了把 _reader fd 注册进 selectors。
+    #   * shutdown_read_fd/write_fd：一对 os.pipe()，专门用来零延迟唤醒
+    #     阻塞在 select 上的调度线程（详见 _scheduler_loop）。
+    #   * pin_buffer：跨进程共享的 op 元数据槽池（详见 register_op_to_buffer）。
+    #   * scheduler：DAG 依赖调度器（详见 flexkv/transfer/scheduler.py）。
     def __init__(self,
         gpu_handles: Dict[WorkerKey, List[StorageHandle]],
         model_config: ModelConfig,
@@ -163,6 +260,8 @@ class TransferEngine:
         self.model_config: ModelConfig = model_config
         self.cache_config: CacheConfig = cache_config
 
+        # 本 PP stage（本进程负责的层段）的层数，后面算传输字节数时要用：
+        # 一次 op 只搬本 stage 的层，按全模型层数算会高估。
         first_handles = next(iter(gpu_handles.values()))
         self._num_layers_for_local_pp_stage = first_handles[0].kv_layout.num_layer
 
@@ -215,6 +314,9 @@ class TransferEngine:
             GLOBAL_CONFIG_FROM_ENV.index_accel and cache_config.enable_kv_sharing
         )
 
+        # 槽池容量 2048 = 同时在飞的 op 数上限（每个 op 占 src/dst 两个槽，
+        # 槽位按 block id 内容哈希复用，相同内容的 op 会命中同一个槽）。
+        # 槽位耗尽时分配会阻塞/失败，表现为调度线程整体卡住。
         self.pin_buffer = SharedOpPool(2048, self.cache_config.num_cpu_blocks)
 
         self.op_id_to_nvtx_range: Dict[int, str] = {}
@@ -249,6 +351,13 @@ class TransferEngine:
         # finalized, when their pending_count drains to zero.
         self._failed_parent_op_ids: Set[int] = set()
 
+    # 中文：给单个 worker 装配"多层组布局"(layer_groups) 参数。
+    # 多层组 = 一张 KV 被切成若干层组（如主 KV 组 + MLA indexer 组），
+    # 同一个 block id 在各组里的 layout 不同，worker 必须按组分别取
+    # handle/layout 才不会搬错字节。
+    # TP=1 时一个 WorkerKey 只对应一张卡，所以取下标 [0]。
+    # 没配 layer_groups（或该 key 没有分组数据）返回空 dict —— 是"可选增强"，
+    # worker 侧收到空就退回单组布局，不会报错。
     def _get_multi_group_kwargs_tp1(self, worker_key: WorkerKey) -> dict:
         """Get multi-group kwargs for TP=1 workers (GPUCPU / GDS)."""
         if (self.model_config.layer_groups is None or
@@ -267,6 +376,11 @@ class TransferEngine:
             gpu_layouts_per_group=per_device_group_layouts,
         )
 
+    # 中文：TP>1 版本的多层组参数装配。与 tp1 版唯一的区别是这里多做一次转置：
+    # _gpu_blocks_per_group 的入参是 [device][group]（每个 TP 卡一份，
+    # 每份再按层组列 handle），而 worker 侧的执行单元是"层组"——一个层组要
+    # 横跨 TP 组的所有卡同时搬，所以必须转成 [group][device] 传下去。
+    # 维度搞反的表现是：数据能搬完不报错，但每张卡拿到的是别人的分片。
     def _get_multi_group_kwargs_tp(self, worker_key: WorkerKey) -> dict:
         """Get multi-group kwargs for TP>1 workers (tpGPUCPU / tpGDS)."""
         if (self.model_config.layer_groups is None or
@@ -299,6 +413,9 @@ class TransferEngine:
             gpu_layouts_per_group=layouts_by_group,
         )
 
+    # 中文：SWA 专用池版本的多层组参数。逻辑与主 KV 的 tp1 版完全一致，
+    # 只是数据源换成 _swa_*（SWA 层 / state sidecar 有自己独立的显存池、
+    # CPU 池和 layout，尺寸与主 KV 不同，不能共用 handle）。
     def _get_swa_multi_group_kwargs_tp1(self, worker_key: WorkerKey) -> dict:
         """Return DSv4 SWA/state sidecar groups for a one-device worker."""
         if (
@@ -318,6 +435,8 @@ class TransferEngine:
             gpu_layouts_per_group=per_device_layouts,
         )
 
+    # 中文：SWA 专用池版本的多层组参数（TP>1）。同样做 [device][group]
+    # -> [group][device] 转置，理由见 _get_multi_group_kwargs_tp。
     def _get_swa_multi_group_kwargs_tp(self, worker_key: WorkerKey) -> dict:
         """Return SWA/state sidecar groups reshaped as [group][device]."""
         if (
@@ -345,6 +464,9 @@ class TransferEngine:
             ],
         )
 
+    # 中文：SWA 专用池版本的多层组参数。逻辑与主 KV 的 tp1 版完全一致，
+    # 只是数据源换成 _swa_*（SWA 层 / state sidecar 有自己独立的显存池、
+    # CPU 池和 layout，尺寸与主 KV 不同，不能共用 handle）。
     def _get_swa_multi_group_kwargs_tp1(self, worker_key: WorkerKey) -> dict:
         """Return DSv4 SWA/state sidecar groups for a one-device worker."""
         if (
@@ -364,6 +486,8 @@ class TransferEngine:
             gpu_layouts_per_group=per_device_layouts,
         )
 
+    # 中文：SWA 专用池版本的多层组参数（TP>1）。同样做 [device][group]
+    # -> [group][device] 转置，理由见 _get_multi_group_kwargs_tp。
     def _get_swa_multi_group_kwargs_tp(self, worker_key: WorkerKey) -> dict:
         """Return SWA/state sidecar groups reshaped as [group][device]."""
         if (
@@ -391,6 +515,13 @@ class TransferEngine:
             ],
         )
 
+    # 中文：给 LayerwiseTransferWorker 装配 SWA 参数。分两种形态：
+    #   * 配了 _swa_layer_groups（DSv4 state sidecar 等多组形态）-> 走多组分支，
+    #     传 swa_layer_groups + 按组/按卡的 handle；
+    #   * 否则是"均匀 SWA"（所有 SWA 层同一 layout）-> 传 swa_gpu_blocks /
+    #     swa_gpu_kv_layouts 列表（每卡一份）+ 单一 swa_dtype。
+    # 关键点：layerwise 模式下 SWA 不会单独建 H2D worker，而是作为附加参数
+    # 塞进 LAYERWISE worker，由它在逐层流水里顺带把 SWA 层一起搬上 GPU。
     def _get_layerwise_swa_kwargs(self, worker_key: WorkerKey) -> dict:
         """SWA args for LayerwiseTransferWorker (uniform or multi-group).
 
@@ -441,6 +572,54 @@ class TransferEngine:
         )
 
     def _init_workers(self) -> None:
+        """按集群拓扑创建全部 Worker 子进程，建好路由表，最后拉起调度线程。
+
+        本文件唯一的"建拓扑"入口，由 start() 调用；_running 为真时直接返回（只建一次）。
+
+        产物（后续调度线程完全依赖这两张表派发 op）：
+          self._worker_map     : TransferType -> WorkerHandle 或 Dict[WorkerKey, WorkerHandle]
+          self._swa_worker_map : 同上，SWA（滑动窗口）专用池的那一份
+        值为 WorkerHandle 表示"单实例"（一个进程服务全机，多见于与 GPU 拓扑
+        无关的通路）；值为 dict 表示"按 WorkerKey(dp_client_id, pp_rank) 分桶"。
+
+        Worker 种类 / 创建条件 / 粒度一览：
+
+          | 通路(TransferType)   | Worker 类                        | 创建条件                                       | 粒度   |
+          |----------------------|----------------------------------|------------------------------------------------|--------|
+          | H2D   (CPU->GPU)     | GPUCPUTransferWorker             | 非 layerwise 且 TP==1                          | 按 key |
+          | H2D                  | tpGPUCPUTransferWorker           | 非 layerwise 且 TP>1                           | 按 key |
+          | D2H   (GPU->CPU)     | 同上两个类                        | 总是创建（layerwise 模式也建）                  | 按 key |
+          | DISK2H(SSD->CPU)     | CPUSSDDiskTransferWorker         | 有 ssd_handle 且非 layerwise                   | 单实例 |
+          | H2DISK(CPU->SSD)     | CPUSSDDiskTransferWorker         | 有 ssd_handle                                  | 单实例 |
+          | REMOTE2H / H2REMOTE  | CPURemoteTransferWorker(读写各一) | 有 remote_handle                               | 单实例 |
+          | REMOTE2H / H2REMOTE  | MooncakeStoreTransferWorker      | 无 remote_handle 但 use_mooncake_store_backend | 单实例 |
+          | DISK2D / D2DISK      | NixlTransferWorker               | enable_gds 且 enable_nixl（要求 TP==1）        | 按 key |
+          | DISK2D / D2DISK      | GDSTransferWorker                | enable_gds 且 TP==1                            | 按 key |
+          | DISK2D / D2DISK      | tpGDSTransferWorker              | enable_gds 且 TP>1                             | 按 key |
+          | LAYERWISE            | LayerwiseTransferWorker          | enable_layerwise_transfer                      | 按 key |
+          | PEERH2H / PEERSSD2H  | PEER2CPUTransferWorker           | enable_kv_sharing 且 (enable_p2p_cpu 或 p2p_ssd)| 单实例 |
+          | SWA 各通路            | 与主 KV 同构的类，绑 SWA 专用池    | _has_swa（有 swa_gpu_handles 且 swa_cpu_handle）| 同左   |
+
+        三个拓扑开关如何影响创建决策：
+          * TP（effective_tp_size_per_node）：决定用单卡 worker 还是 tp* worker。
+            tp* worker 内部按 TP 组切分 block，一次 submit 覆盖整组所有卡，
+            所以"按 key"的粒度是 TP 组而非单卡 —— 一个 op 只需发给一个 worker，
+            不需要调用方自己按卡展开。
+          * GDS：开启后 SSD<->GPU 走 GPUDirect Storage 直通（DISK2D/D2DISK），
+            绕开 CPU 中转的 DISK2H+H2D 两步。GDS worker 与 CPU-SSD worker
+            可以同时存在，走哪条路由控制面在 DAG 里决定（本文件只管派发）。
+          * Layerwise：开启后不再建 H2D 与 DISK2H 的独立 worker，二者被
+            LAYERWISE worker 吸收（末尾三条 assert 校验）。原因是逐层传输要求
+            "读盘与拷 GPU 在同一进程内按层流水"，拆成两个进程做不到。
+          * SWA：SWA 层的 KV 尺寸/layout 与主 KV 不同，放在独立池里，
+            所以整套通路复制一份到 _swa_worker_map，但共用同一个
+            finished_ops_queue（回收路径不区分主 KV / SWA）。
+
+        Note:
+            会阻塞等待每个 worker 的 ready_event：子进程要各自初始化 CUDA 上下文，
+            这一步可能很慢；若子进程 init 失败会抛 RuntimeError（由 start() 回滚）。
+            一张 worker 都没建出来会抛 ValueError，属于配置错误。
+        """
         if self._running:
             return
         self._worker_map: Dict[TransferType, Union[WorkerHandle, Dict[WorkerKey, WorkerHandle]]] = {}
@@ -992,6 +1171,10 @@ class TransferEngine:
         if len(self._worker_map) == 0:
             raise ValueError("No workers initialized, please check the config")
 
+        # 中文：spawn 出来的子进程要在自己进程里建 CUDA 上下文、import vLLM 的
+        # VMM 映射，慢且可能失败（典型是 GPU0 上抢占显存导致 CUDA OOM）。
+        # 所以不能无脑 wait()：每 5s 醒一次看进程是不是已经死了，死了立刻抛，
+        # 否则会一直卡在启动阶段且看不到真正的报错。
         def _wait_worker_ready(
             worker: WorkerHandle,
             transfer_type: TransferType,
@@ -1040,11 +1223,19 @@ class TransferEngine:
                 "LAYERWISE worker must exist when layerwise transfer is enabled"
 
         # Start scheduler thread
+        # 中文：_running 必须先置 True 再 start 线程，否则线程里的
+        # while self._running 可能一进去就退出（竞态）。
         self._running = True
         self._scheduler_thread = threading.Thread(target=self._scheduler_loop)
         self._scheduler_thread.start()
 
     def _collect_worker_handles(self) -> List[WorkerHandle]:
+        """把 _worker_map 与 _swa_worker_map 里所有 WorkerHandle 摊平成一个列表。
+
+        两张 map 的值既可能是单个 WorkerHandle，也可能是 Dict[WorkerKey, ...]，
+        这里统一摊平，供 shutdown / 回滚路径遍历。用 getattr 取 map 是因为
+        _init_workers 可能中途失败（此时 _worker_map 还没建出来）。
+        """
         handles: List[WorkerHandle] = []
         for worker in getattr(self, "_worker_map", {}).values():
             if isinstance(worker, dict):
@@ -1058,6 +1249,9 @@ class TransferEngine:
                 handles.append(worker)
         return handles
 
+    # 中文：并行停 worker。为什么必须并行——每个 worker 退出时要做
+    # cudaHostUnregister 等清理，单进程耗时可能到秒级；串行关几十个 worker
+    # 会成倍叠加，很容易超过上层的关停超时。并行后总耗时≈最慢的那个。
     def _shutdown_worker_handles(self, handles: List[WorkerHandle]) -> None:
         """Stop worker processes in parallel (send sentinel + join/unregister)."""
         if not handles:
@@ -1087,6 +1281,9 @@ class TransferEngine:
         for t in threads:
             t.join()
 
+    # 中文：_init_workers 中途失败的补偿路径。spawn 是逐个建进程的，
+    # 第 N 个失败时前 N-1 个已经起来并占着 GPU/共享内存，必须回收，
+    # 否则失败重试会残留僵尸 worker 并泄漏显存。best-effort：任何异常都吞掉。
     def _rollback_init_workers(self, err: BaseException) -> None:
         """Best-effort cleanup when spawn/ready fails before engine is running."""
         handles = self._collect_worker_handles()
@@ -1102,6 +1299,11 @@ class TransferEngine:
             self._swa_worker_map = {}
 
     def start(self) -> None:
+        """启动引擎：建 worker 进程 + 拉起调度线程（阻塞，直到所有 worker ready）。
+
+        调用者：KVTaskEngine / KVManager 初始化阶段。成功后本文件进入可服务状态，
+        上层即可 submit_transfer_graph。失败会先回滚已建好的 worker 再抛出。
+        """
         try:
             self._init_workers()
         except Exception as e:
@@ -1112,6 +1314,40 @@ class TransferEngine:
                 self._rollback_init_workers(e)
             raise
 
+    # ==========================================================================
+    # 中文：本文件的心脏。单线程事件循环，唯一修改调度状态的线程。
+    #
+    # 监听什么（3 个 fd 全部注册进同一个 selectors，一次 select 同时等）：
+    #   1. task_queue._reader         -> 上层提交了新 DAG（submit_transfer_graph）
+    #   2. finished_ops_queue._reader -> 任意 worker 回报"某个 op 搬完了/失败了"
+    #                                    （所有 worker 共用这一条队列，靠 payload 里的
+    #                                     op_id 区分是谁、是父 op 还是 PP 副本）
+    #   3. shutdown_read_fd           -> shutdown 唤醒管道（纯通知，无数据语义）
+    # 用 mp.Queue 而不是 queue.Queue，就是为了拿它的 _reader fd 注册进 selectors；
+    # select(timeout=None) 完全阻塞，所以没有轮询开销，也没有固定超时的延迟惩罚。
+    #
+    # 一轮循环做四件事（顺序有讲究）：
+    #   ① 收新图    ：把 task_queue 里所有图一次性 get_nowait 抽干，交给
+    #                  scheduler.add_transfer_graph（注意：这里只入 DAG，不派发）。
+    #                  payload 可能是单个图也可能是 list（批量提交），两种都要支持。
+    #   ② 收完成    ：把 finished_ops_queue 抽干。每个 payload 走两条分支之一：
+    #                  - 是副本 op（在 _child_to_parent_op_id 里）：parent.pending_count--
+    #                    ，归零才认为整个 op 完成（PP 各 stage 原子完成）。
+    #                  - 是父 op：直接 pending_count--，归零即完成。
+    #                  完成/失败都走 _finalize_or_discard / _handle_failed_op。
+    #   ③ 推进 DAG  ：只有"有图完成或有新图"时才调 scheduler.schedule(finished_ops)，
+    #                  拿回 (已完成的 graph_id 列表, 下一批就绪的 op)。
+    #                  —— DAG 内部的依赖/就绪判定全在 scheduler.py，本文件只消费结果。
+    #   ④ 派发 + 汇报：就绪 op 逐个 _assign_op_to_worker 发给具体 worker；
+    #                  VIRTUAL op 不落盘不搬运，直接伪造一个完成通知塞回上层；
+    #                  已完成的 graph_id 打包成 CompletedOp.completed_graph 推给上层。
+    #
+    # 为什么不加锁：op_id_to_op / _child_to_parent_op_id / scheduler / pin_buffer
+    # 全部只在本线程读写，对外只通过 mp.Queue，因此无需任何锁。
+    #
+    # 出错不退出：整个循环体包在 try 里，异常只记日志 + sleep 1ms 继续，
+    # 避免一次偶发错误让整个数据面停摆（日志里会打印各映射表前 16 个 key 便于定位）。
+    # ==========================================================================
     def _scheduler_loop(self) -> None:
         """Event-driven scheduler loop using selectors (ZERO LATENCY with shutdown pipe)"""
         from flexkv.common.debug import flexkv_logger
@@ -1245,6 +1481,8 @@ class TransferEngine:
                     completed_graph_ids, next_ops = self.scheduler.schedule(finished_ops)
                     # Distribute new ops to workers
                     for op in next_ops:
+                        # VIRTUAL op 是 DAG 里的"记账/汇合"节点（无实际数据搬运），
+                        # 不发给任何 worker，直接伪造完成通知让上层推进状态机。
                         if op.transfer_type == TransferType.VIRTUAL:
                             self.completed_queue.put(CompletedOp(graph_id=op.graph_id, op_id=op.op_id))
                         else:
@@ -1285,6 +1523,12 @@ class TransferEngine:
         sel.close()
         flexkv_logger.info("TransferEngine scheduler loop stopped")
 
+    # 中文：pin_buffer 的"谁注册谁释放"判定——这是本文件最容易出 bug 的约定。
+    #   单实例 worker 通路：父 op 自己在调度线程注册，也在这里释放（1 次）。
+    #   dict(PP fan-out) 通路：父 op 根本不注册，每个副本各注册各释放（N 次）。
+    # 两条路必须严格互斥，混用会导致槽位双重释放（别的 op 的数据被写花）
+    # 或漏释放（槽位耗尽后 allocate 卡死）。派发、_finalize_op、_discard_failed_op
+    # 三处共用这一个判定，保证口径一致。
     def _op_buffer_registered_here(self, op: TransferOp) -> bool:
         """The 'unified rule' shared by dispatch, _finalize_op and
         _discard_failed_op: a parent op's pin buffer is registered (and thus
@@ -1297,6 +1541,10 @@ class TransferEngine:
             resolved_worker = self._worker_map.get(op.transfer_type)
         return resolved_worker is not None and not isinstance(resolved_worker, dict)
 
+    # 中文：op 的 pending_count 归零后的分流闸门。
+    # 有副本失败过 -> _discard_failed_op（静默丢弃，绝不发完成通知，也绝不放行
+    # 后继 op，否则上层会拿到"部分搬完"的 KV 并当成完整前缀用，直接算错结果）；
+    # 全部成功 -> _finalize_op（发完成通知 + 让 scheduler 推进后继）。
     def _finalize_or_discard(self, op: TransferOp, finished_ops: List[TransferOp]) -> None:
         """Route a fully-drained op: discard if any replica of it failed,
         finalize (completion message + successor scheduling) otherwise."""
@@ -1317,6 +1565,10 @@ class TransferEngine:
         trace.dec_inflight()
         trace.record_xfer(op_id, metrics, e2e_ms)
 
+    # 中文：失败传播链的起点。worker 报错 -> 这里把 op 标记失败、pending_count
+    # 照样递减（否则永远收不齐）、graph 记入 _failed_graph_ids 并调
+    # scheduler.fail_graph 让该图剩余 op 不再派发；等这张图在飞的 op 全部排干后，
+    # 由 _emit_drained_graph_failures 统一发一次"整图失败"给上层。
     def _handle_failed_op(self, op_id: int) -> None:
         """A worker reported a failed transfer for ``op_id``.
 
@@ -1367,6 +1619,10 @@ class TransferEngine:
         self.op_id_to_op.pop(op.op_id, None)
         self._failed_parent_op_ids.discard(op.op_id)
 
+    # 中文：为什么要"等排干再报整图失败"——如果 op 一失败就立刻报图失败，
+    # 上层的回滚（释放 block、回滚索引）会和还在飞的兄弟 op 的完成回调抢同一批
+    # block，出现"回滚完了数据又被写回来"。所以这里等 op_id_to_op 里该图的
+    # op 全部消失后才发通知。
     def _emit_drained_graph_failures(self) -> None:
         """Report each failed graph to the task layer once its dispatched ops
         have all drained, so the task's rollback never races an in-flight op's
@@ -1377,6 +1633,14 @@ class TransferEngine:
             self.completed_queue.put(CompletedOp.failed_graph(graph_id))
             self._failed_graph_ids.discard(graph_id)
 
+    # 中文：op 真正完成时的收尾。三件事：
+    #   1) 按统一规则释放 pin_buffer 槽位；
+    #   2) 算这次传输的字节数（用于上层统计带宽/命中收益）并往 completed_queue
+    #      推一个 CompletedOp —— 这是数据面回给上层的唯一出口；
+    #   3) 把 op 放进 finished_ops，交给本轮末尾的 scheduler.schedule() 去解锁
+    #      它的后继 op（注意：本文件不自己判断后继，那是 scheduler.py 的活）。
+    # 字节数为什么要按"本 PP stage 的层数"折算：每张图的 block 只含本 stage
+    # 负责的层，直接乘全模型层数会系统性高估。
     def _finalize_op(self, op: TransferOp, finished_ops: List[TransferOp]) -> None:
         """Finalize a completed op: release pin buffer, notify upper layer, and clean up.
 
@@ -1410,6 +1674,11 @@ class TransferEngine:
         finished_ops.append(op)
         del self.op_id_to_op[op.op_id]
 
+    # 中文：合并多个副本（PP 各段 / TP 各卡）回报的"每个 block 是否成功"。
+    # 合并规则是逻辑与：任一个副本说某 block 失败，该 block 就整体算失败
+    # （partial success 不能算命中，上层必须按未命中处理，否则会用残缺 KV 算错）。
+    # 长度不一致视为全部失败并记 error —— 这是 worker 与本层对 block 数理解
+    # 不一致的信号，不能静默放过。
     @staticmethod
     def _merge_block_results(
         op: TransferOp,
@@ -1430,6 +1699,10 @@ class TransferEngine:
             op.block_results = tuple(
                 old and new for old, new in zip(op.block_results, normalized))
 
+    # 中文：PP fan-out 的"找兄弟"逻辑。WorkerKey = (dp_client_id, pp_rank)，
+    # 同一个 dp_client_id 下的所有 pp_rank 就是同一请求的各流水段，它们必须
+    # 收到同一份 op 副本（各段只搬自己那份层）。扁平化后 dp_client_id 已能
+    # 唯一标识一个 DP 切片，所以这里只按它过滤。
     @staticmethod
     def _match_pp_siblings(
         worker_map: Dict[WorkerKey, WorkerHandle],
@@ -1442,6 +1715,10 @@ class TransferEngine:
         """
         return [wk for wk in worker_map if wk.dp_client_id == dp_client_id]
 
+    # 中文：逐层传输 op 的 PP fan-out。与普通 op 的差别在于副本类型是
+    # LayerwiseTransferOp，一次副本里同时带 h2d 与 disk2h 两组 block id
+    # （以及对应的 SWA id）—— 因为逐层流水要求"读盘"和"拷 GPU"由同一个
+    # worker 进程内交错执行，不能拆成两个 op。
     def _assign_layerwise_op_to_workers(self, op: TransferOp) -> None:
         """Fan-out a LAYERWISE op symmetrically to every local PP-stage
         sibling worker matching ``op.dp_client_id``."""
@@ -1491,6 +1768,10 @@ class TransferEngine:
                 f"parent_op_id={op.op_id}, replica_op_id={replica.op_id}, "
                 f"worker_key={wk}, pending_count={op.pending_count}")
 
+    # 中文：SWA op 的派发，与主 KV 的 _assign_op_to_worker 结构完全对称
+    # （dict -> PP fan-out；单实例 -> 直接提交），唯一区别是查 _swa_worker_map。
+    # SWA op 由控制面在构图时直接标 is_swa=True，本文件不做任何"从主 KV op
+    # 派生 SWA op"的推断。
     def _assign_swa_op_to_worker(self, op: TransferOp) -> None:
         """Route a graph-built ``is_swa=True`` op to the SWA worker map.
 
@@ -1559,6 +1840,40 @@ class TransferEngine:
                 f"blocks={op.src_block_ids.size}, pending_count={op.pending_count}"
             )
 
+    # ==========================================================================
+    # 中文：op -> worker 的路由总入口（DAG 拆解的最后一跳）。
+    #
+    # "一张图怎么被拆成 op 发给 worker"的完整链路：
+    #   控制面把一次 GET/PUT 编成 TransferOpGraph（节点=op，边=依赖）
+    #   -> 上层 submit_transfer_graph 整图丢进 task_queue
+    #   -> 调度线程塞进 scheduler（scheduler.py 负责算哪些 op 已就绪）
+    #   -> 每轮 schedule() 返回"这一拍可以跑的 op 列表"
+    #   -> 【本函数】逐个 op 决定"派给哪个 worker 进程"
+    # 所以：拆 DAG 的是 scheduler.py，挑 worker 的是本函数，二者分工明确。
+    #
+    # 分配策略（两级，先按通路再按拓扑）：
+    #   第一级：op.transfer_type 决定查哪张表的哪个键
+    #           （H2D/D2H/DISK2H/H2DISK/REMOTE2H/... = 一条"设备对"通路）。
+    #           换句话说：按"源设备->目的设备这条通路"选 worker 种类。
+    #   第二级：取到的值决定发几份
+    #           - 单个 WorkerHandle（CPU<->SSD、CPU<->Remote 等与 GPU 拓扑无关的
+    #             通路）：pending_count=1，直接 submit。
+    #           - Dict[WorkerKey, WorkerHandle]（H2D/D2H/GDS/LAYERWISE 等）：
+    #             PP fan-out —— 按 op.dp_client_id 找出所有 pp_rank 兄弟，
+    #             每个兄弟复制一份副本 op，各自 register 槽位、各自 submit，
+    #             每份让父 op 的 pending_count +1。
+    #           即"按 DP 切片选具体进程"，PP 各段各收一份，靠 pending_count 归零
+    #           保证它们原子完成。
+    #
+    # 另外两条特殊路由：
+    #   - op.is_swa 为真 -> 转 _assign_swa_op_to_worker，查 _swa_worker_map
+    #     （SWA 池与主 KV 池是两套显存/内存，通路完全隔离）。
+    #   - transfer_type == LAYERWISE -> 转 _assign_layerwise_op_to_workers。
+    #   - transfer_type == VIRTUAL  -> 直接返回（DAG 记账节点，不落地搬运）。
+    #
+    # 隐含约定：pending_count 必须在本线程 submit 之前自增（本函数是唯一自增点），
+    # 否则 worker 回报到达时计数还没设好，会提前归零误判完成。
+    # ==========================================================================
     def _assign_op_to_worker(self, op: TransferOp) -> None:
         """Assign operation to appropriate worker."""
         if op.transfer_type == TransferType.VIRTUAL:
@@ -1621,6 +1936,13 @@ class TransferEngine:
             op.pending_count += 1
             worker.submit_transfer(op)
 
+    # ==========================================================================
+    # 中文：上层（KVTaskEngine）提交 DAG 的唯一入口 —— 数据面的"入口阀门"。
+    # 非阻塞：只把图（或图的 list，批量提交）塞进 task_queue 就返回，
+    # 真正的拆图、派发都在调度线程里做，所以提交方不会被 worker 的执行时间拖住。
+    # 调用方需要记住 graph_id：后续靠 get_completed_graphs_and_ops 捞回来的
+    # CompletedOp 里带 graph_id，据此判断哪个请求搬完了。
+    # ==========================================================================
     def submit_transfer_graph(self, transfer_graph: Union[TransferOpGraph, List[TransferOpGraph]]) -> None:
         """Submit a transfer graph for execution"""
         nvtx_range = nvtx.start_range(message="TransferEngine.submit_transfer_graph", color="green")
@@ -1629,6 +1951,24 @@ class TransferEngine:
         self.task_queue.put(transfer_graph)
         nvtx.end_range(nvtx_range)
 
+    # ==========================================================================
+    # 中文：上层（KVTaskEngine 的结果线程）回收完成通知的唯一出口 —— "出口阀门"。
+    #
+    # 汇聚路径：worker 搬完 -> 写 finished_ops_queue -> 调度线程扣 pending_count
+    #   -> 归零后 _finalize_op 往 completed_queue 推 CompletedOp
+    #   -> 【本函数】一次性抽干 completed_queue 返回给上层。
+    # 所以上层看到的 CompletedOp 是"已经把 PP 各段副本合并过"的完成事件，
+    # 不需要自己关心 fan-out。
+    #
+    # 返回的 CompletedOp 有三种形态（见 common/transfer.py）：
+    #   - 带 op_id + transfer_type/num_bytes：某个 op 搬完了，用于统计与精细回调
+    #   - completed_graph(graph_id)：整张图跑完
+    #   - failed_graph(graph_id)   ：整图失败（等该图在飞 op 排干后才发）
+    #
+    # 语义细节：timeout>0 时只"阻塞等第一个"、不等后续 —— 拿到第一个后就把队列里
+    # 现成的全带走（批量摊薄系统调用）。这样既不会忙等烧 CPU，也不会为了凑批
+    # 而人为增加延迟。
+    # ==========================================================================
     def get_completed_graphs_and_ops(self, timeout: Optional[float] = None) -> List[CompletedOp]:
         """Drain completed ops, blocking up to ``timeout`` for the first one.
 
@@ -1658,6 +1998,12 @@ class TransferEngine:
 
         return completed_ops
 
+    # 中文：GPU 热重映射（配合 vLLM sleep/wake 这类"引擎休眠-唤醒"场景）。
+    # worker 启动时把 vLLM 的显存以 VMM 方式导入到自己进程；vLLM 休眠会作废
+    # 这些映射，必须先让 worker 主动释放（suspend），唤醒时再导入新的（resume）。
+    # 这样才能做到"不重建 worker 进程、不重新 spawn（省掉几十秒的 CUDA 初始化）"。
+    # 前置校验很严格：有在飞传输、开了 layerwise / 多组布局 / SWA 都不支持。
+    # 返回值是成功释放的映射数量，供上层核对。
     def suspend_gpu_mappings(self) -> int:
         """Drain worker pipes and release imported vLLM VMM mappings."""
         if self._gpu_mappings_suspended:
@@ -1685,6 +2031,9 @@ class TransferEngine:
         self._gpu_mappings_suspended = True
         return released
 
+    # 中文：suspend 的逆操作。要求传进来的 gpu_handle_groups 的 key 集合与启动时
+    # 完全一致（拓扑变了必须重建引擎，不能热重映射），只是 handle 内容换成唤醒后
+    # 的新 VMM handle。TP=1 传单卡 handle 列表，TP>1 传每卡一份的列表。
     def resume_gpu_mappings(
         self, gpu_handle_groups: Dict[WorkerKey, List[StorageHandle]]
     ) -> int:
@@ -1714,6 +2063,15 @@ class TransferEngine:
         self._gpu_mappings_suspended = False
         return imported
 
+    # 中文：关停顺序是有讲究的，改动前先想清楚每一步的目的：
+    #   1) _running=False  + 写 shutdown 管道：把阻塞在 select(timeout=None) 的
+    #      调度线程立刻唤醒（不写就只能等下一个事件，可能永远等不到）。
+    #   2) join 调度线程：确保没有线程再往 worker 通道里塞新 op。
+    #   3) 关管道 fd。
+    #   4) 并行停 worker（见 _shutdown_worker_handles）。
+    #   5) 抽干 finished_ops_queue：子进程写入的残留消息不清掉，mp.Queue 的
+    #       feeder 线程可能让主进程 join 时卡住。
+    #   6) empty_cache + 有界 cuda 同步（见 _te_bounded_cuda_sync）。
     def shutdown(self) -> None:
         """Shutdown the transfer engine"""
         try:

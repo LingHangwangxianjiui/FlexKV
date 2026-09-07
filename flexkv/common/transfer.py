@@ -28,6 +28,19 @@
 #   DeviceType -> TransferType -> TransferOpStatus -> TransferOp
 #   -> TransferOpGraph（及其 add_dependency / take_ready_ops / set_gpu_blocks）
 #   -> merge_to_batch_graph（较复杂，建议第二遍再读）
+#
+# 两个最容易混淆的枚举，务必先分清（它们是理解全系统的钥匙）：
+#   DeviceType   —— 描述"数据**在哪**"，是静态的存储层级（CPU/GPU/SSD/REMOTE/PEER*）。
+#                   控制面用它向 StorageEngine 取句柄：
+#                   storage_engine.get_storage_handle(DeviceType.GPU, device_id)。
+#   TransferType —— 描述"要做一次什么**搬运动作**"，是动态的一跳通路（H2D/D2H/DISK2H...）。
+#                   数据面用它决定把 op 派发给哪个 Worker：
+#                   TransferEngine._worker_map[transfer_type]。
+#   一句话记忆：DeviceType 管"存到哪 / 取哪个句柄"，TransferType 管"怎么搬 / 派给谁"。
+#
+# 完成回传机制速览（详见 CompletedOp / CompletionAwareCallback 处的注释）：
+#   Worker 进程 -> completed_queue -> TransferEngine 调度循环 -> KVTaskEngine
+#   -> invoke_op_callback(cb, completed_op) -> op_callback_dict[op_id] 注册的回调。
 # ==============================================================================
 
 import threading
@@ -40,6 +53,10 @@ import numpy as np
 from flexkv.common.debug import flexkv_logger
 
 
+# 数据面 worker 的路由键：(dp_client_id, pp_rank) 二元组。
+# 同一个 TransferType 在 DP/PP 并行下会有多个 worker 实例
+# （如 h2d_workers: Dict[WorkerKey, WorkerHandle]），TransferEngine 用这个键
+# 把 op 派发给它所属的那一组 GPU。frozen=True 才能作为 dict key 使用。
 @dataclass(frozen=True)
 class WorkerKey:
     """Immutable, hashable key that uniquely identifies a worker by
@@ -75,12 +92,18 @@ class CompletedOp:
     # constructor-compatible with existing producers/consumers.
     failed: bool = False
 
+    # 图级别"整图成功"判定：op_id == -1 且非 failed
     def is_graph_completed(self) -> bool:
         return self.op_id == -1 and not self.failed
 
+    # 图级别"整图失败"判定：op_id == -1 且 failed。
+    # 控制面收到它后不再等待剩余 op，直接走失败回滚路径。
     def is_graph_failed(self) -> bool:
         return self.op_id == -1 and self.failed
 
+    # 从合并后的大 op 的完成结果里，切出某个原始小 op 对应的那一段 block 结果。
+    # merge_to_batch_graph 把 N 个小 op 拼成一个大 op 后，每个小 op 的回调
+    # 只能看到自己那一段，所以必须靠 (offset, count) 切分。
     def slice_blocks(self, offset: int, count: int) -> 'CompletedOp':
         """Return this completion restricted to one pre-merge op span."""
         if self.block_results is None:
@@ -96,6 +119,8 @@ class CompletedOp:
             block_results=self.block_results[offset:end],
         )
 
+    # to_tuple / from_tuple 是为了跨进程（multiprocessing.Queue）传输时用更紧凑的
+    # 二元组形态传递，接收端再还原成 CompletedOp。
     def to_tuple(self) -> Tuple[int, int]:
         return (self.graph_id, self.op_id)
 
@@ -103,6 +128,7 @@ class CompletedOp:
     def from_tuple(cls, data: Tuple[int, int]) -> 'CompletedOp':
         return cls(graph_id=data[0], op_id=data[1])
 
+    # 两个图级别消息的构造工厂，语义分别是"整图成功完成"与"整图失败终止"。
     @classmethod
     def completed_graph(cls, graph_id: int) -> 'CompletedOp':
         return cls(graph_id=graph_id, op_id=-1)
@@ -112,6 +138,20 @@ class CompletedOp:
         return cls(graph_id=graph_id, op_id=-1, failed=True)
 
 
+# 完成回调存在两套协议，这是历史演进留下的"双协议"设计：
+#
+#   旧协议：Callable[[], None]              —— 零参数，只表示"这个 op 干完了"。
+#   新协议：CompletionAwareCallback          —— 接受一个 CompletedOp，
+#           能读到 block_results（逐 block 成败）等细节。
+#
+# 之所以要包一层类而不是直接用 Callable[[CompletedOp], None]：
+# 调度侧拿到回调时无法从签名可靠地区分两种协议（很多回调是 functools.partial /
+# bound method），用显式包装类做标记最稳妥。统一入口是 invoke_op_callback()，
+# 它按 isinstance 判断后分发，所以业务代码不需要关心自己拿到的是哪一种。
+#
+# 控制面注册处见 cache/cache_engine.py（如 MooncakeLoadResult.record 被
+# CompletionAwareCallback 包裹后放进 op_callback_dict），消费处见
+# kvtask.py 的 invoke_op_callback(...) 调用。
 @dataclass(frozen=True)
 class CompletionAwareCallback:
     """Opt-in wrapper for callbacks that consume a ``CompletedOp`` result."""
@@ -122,6 +162,9 @@ class CompletionAwareCallback:
         self.callback(completed_op)
 
 
+# 回调的唯一统一入口：屏蔽新旧两套协议差异。
+# 注意旧协议回调拿不到 completed_op，所以"部分成功"这类信息只有走
+# CompletionAwareCallback 的回调才能看到（典型用途：Mooncake 远端只读回了一部分 block）。
 def invoke_op_callback(callback: Callable,
                        completed_op: Optional[CompletedOp] = None) -> None:
     """Invoke old zero-argument callbacks and result-aware callbacks uniformly."""
@@ -170,6 +213,17 @@ class TransferType(Enum):
     PEERSSD2H = "PEERSSD2H"
     H2PEERSSD = "H2PEERSSD"
 
+    # 命名里有个被代码依赖的隐含约定：
+    #   name 以 "2D" 结尾  => 目的端是 GPU（H2D / DISK2D）
+    #   name 以 "D2" 开头  => 源端是 GPU（D2H / D2DISK）
+    # TransferOpGraph.set_gpu_blocks() 正是用 transfer_type.name.endswith("2D")
+    # 来判断该把 GPU block id 填到 dst 还是 src。改枚举名会静默破坏这个判断。
+    #
+    # 下面两个是"非真实搬运"的类型，Worker 不会为它们搬数据：
+    #   VIRTUAL   —— 纯同步点，用来汇合多个前驱的完成事件（见下方英文注释）。
+    #                调度器取到它后立刻 mark_completed，不派发给任何 worker。
+    #   LAYERWISE —— 逐层传输，由 LayerwiseTransferOp 承载，交给 LayerwiseWorker
+    #                与 prefill 计算重叠地按层把 KV 搬上 GPU。
     # if we need to return a results when trasnfer op 1 and op 2 are completed
     # we can add a virtual transfer op 3 that depends on op 1 and op 2
     # so that the op 3 will not be executed actually, but can indicate the completion of
@@ -181,6 +235,11 @@ class TransferType(Enum):
 #     DISTH = "DISTH"
 #     DISTSSD = "DISTSSD"
 
+# block 在多个物理文件（远端存储文件 / SSD 文件）之间的分布方式，
+# 以 .value 的形式透传给 c_ext 的传输函数（见 transfer/worker.py 的调用）：
+#   ROUND_ROBIN —— block 按轮转打散到各个文件
+#   SEQUENTIAL  —— block 连续成段地落在同一个文件里
+# C++ 侧据此计算 block -> (file, offset) 的映射，所以这个枚举的值不能随意改。
 class PartitionBlockType(Enum):
     ROUND_ROBIN = 0
     SEQUENTIAL = 1
@@ -236,6 +295,10 @@ class TransferOp:
     remote_node_ids: Optional[np.ndarray] = None
     # used for distributed cpu and ssd
     src_block_node_ids: Optional[np.ndarray] = None
+    # PP 并行时一个 op 会被复制成多个 replica 分别派发给各 PP 兄弟 worker。
+    # pending_count 记录"还有几个 replica 没回来"，归零才算整个 op 完成
+    # ——这样整组 replica 要么一起成功、要么一起失败，语义是原子的。
+    # 该字段由 TransferEngine 维护，见 transfer_engine.py 的 _finalize_op / _handle_failed_op。
     pending_count: int = 0
     # ---- SWA (Sliding Window Attention) routing -------------------------------
     # When True, this op moves SWA KV (an independent GPU/CPU/SSD/REMOTE pool with
@@ -252,6 +315,8 @@ class TransferOp:
     block_results: Optional[Tuple[bool, ...]] = field(default=None, init=False)
 
     def __post_init__(self) -> None:
+        # VIRTUAL op 不搬数据，src/dst 允许为空（建图时通常就是空数组）；
+        # 其余类型要求 src 与 dst 的 block 数严格一一对应。
         if self.transfer_type != TransferType.VIRTUAL and \
             self.src_block_ids.size != self.dst_block_ids.size:
             raise ValueError(f"src_block_ids and dst_block_ids must have the same number of physical blocks, but got "
@@ -264,6 +329,27 @@ class TransferOp:
         assert self.dst_block_ids.dtype == np.int64
         self.valid_block_num = self.src_block_ids.size
 
+# 逐层（layerwise）传输节点：把"SSD -> CPU"和"CPU -> GPU"两条通路打包进同一个 op，
+# 交给 LayerwiseWorker（transfer/layerwise.py）按**层**粒度执行，
+# 从而把 H2D 传输与 prefill 计算重叠起来。
+#
+# 与普通 TransferOp 的差异（这是理解它的关键）：
+#   1. 普通 op 是"一次性把整批 block 搬完"，中途没有可观测进度；
+#      LAYERWISE op 每搬完一层就通过 eventfd 通知一次（counter_id 指定计数器组，
+#      三缓冲复用），推理引擎侧据此判断"第 N 层的 KV 已就位，可以开始算"。
+#      于是第 N 层的计算与第 N+1 层的传输得以流水重叠，把 H2D 延迟藏进计算里。
+#   2. 它同时携带 DISK2H 和 H2D 两组 block id（外加 SWA 的两组），
+#      即把本来需要两个 op + 一条依赖边表达的事情压平成**一个** op，
+#      因为逐层执行要求两条通路在同一次 launch 内协同，不能拆成两个独立 op。
+#   3. transfer_type 恒为 TransferType.LAYERWISE；传给父类的
+#      src_block_ids / dst_block_ids 是空数组——真正的 block id 放在自己的
+#      *_h2d / *_disk2h 字段里。父类 __post_init__ 只校验两者 size 相等，空数组能通过。
+#
+# 执行顺序有个坑（见下方 __init__ / __post_init__）：
+#   本类手写了 __init__，它先给自己的字段赋值，最后才 super().__init__()；
+#   而父类 TransferOp 是 dataclass，其生成的 __init__ 末尾会调用 self.__post_init__()，
+#   动态分派到本类的 __post_init__。所以 __post_init__ 运行时能看到已赋好的字段值，
+#   字段赋值顺序不能随意调换。
 @dataclass
 class LayerwiseTransferOp(TransferOp):
 
@@ -278,6 +364,10 @@ class LayerwiseTransferOp(TransferOp):
     swa_dst_block_ids_disk2h: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
     counter_id: int = 0  # Counter set index for triple buffering eventfd notification
 
+    # 手写 __init__（而非用 dataclass 生成）：父类有 init=False 的 op_id 字段，
+    # 且这里需要把缺省的 SWA id 归一成空数组后再交给父类校验。
+    # 注意赋值必须在 super().__init__() 之前完成 —— 父类 __init__ 末尾会触发
+    # 本类的 __post_init__，那时这些字段必须已经就位。
     def __init__(self,
                 graph_id: int,
                 src_block_ids_h2d: np.ndarray,
@@ -305,6 +395,8 @@ class LayerwiseTransferOp(TransferOp):
         self.swa_dst_block_ids_disk2h = swa_dst_block_ids_disk2h if swa_dst_block_ids_disk2h is not None else _empty()
         self.counter_id = counter_id
 
+        # 这里传空数组给父类：LAYERWISE op 的 block id 全在子类自己的字段里，
+        # 父类的 src/dst 只用来满足 size 相等的断言。
         super().__init__(
             graph_id=graph_id,
             transfer_type=TransferType.LAYERWISE,
@@ -313,6 +405,7 @@ class LayerwiseTransferOp(TransferOp):
             dp_client_id=dp_client_id,
         )
 
+    # 由父类 dataclass __init__ 末尾自动调用（不是由本类 __init__ 显式调用）。
     def __post_init__(self) -> None:
         super().__post_init__()
 
@@ -367,6 +460,7 @@ class TransferOpGraph:
         # must never be rebound with full-KV block ids (see add_transfer_op).
         self._swa_gpu_transfer_op_id: List[int] = []
 
+    # graph_id 全局自增分配器。锁是类级的，保证多控制线程并发建图时 id 唯一。
     @classmethod
     def _get_graph_id(cls) -> int:
         with cls._lock:
@@ -374,13 +468,23 @@ class TransferOpGraph:
             cls._next_graph_id += 1
             return graph_id
 
+    # 覆写 graph_id。用于跨进程/跨节点场景需要让对端沿用同一 id 的情况
+    # （transfer_manager 里 graph_id 被当作 task_id 做图与 slot_mapping 的配对）。
+    # 注意：它不会推进 _next_graph_id，可能与后续自动分配的 id 撞号，调用前需确认。
     def set_graph_id(self, graph_id: int) -> None:
         self.graph_id = graph_id
 
+    # 空图工厂。控制面判定"无需搬运"时返回空图即可，
+    # KVTaskEngine._process_empty_graph() 见到 num_ops == 0 会直接把任务标记完成。
     @classmethod
     def create_empty_graph(cls) -> "TransferOpGraph":
         return cls()
 
+    # 加入一个 VIRTUAL 节点。它不搬数据，只作为"完成汇合点"：
+    # 多个并行分支都完成后才需要触发的动作（比如整图完成通知），
+    # 就用一个 VIRTUAL op 依赖它们全部（配合 add_dependency）。
+    # need_trigger=True 时节点先挂在 _trigger_ops 里挂起，
+    # 等外部条件满足后由 trigger_op() 主动放行（当前无调用方，属预留机制）。
     def add_virtual_op(self, op: TransferOp, need_trigger: bool = False) -> None:
         op.graph_id = self.graph_id
         op.transfer_type = TransferType.VIRTUAL
@@ -390,6 +494,8 @@ class TransferOpGraph:
         else:
             self._ready_ops.add(op.op_id)
 
+    # 放行一个挂起中的 trigger op：从 _trigger_ops 摘除后直接置为完成，
+    # 从而解锁它的后继。（当前无调用方，见 scheduler.py 中的说明注释。）
     def trigger_op(self, op_id: int) -> None:
         self._trigger_ops.remove(op_id)
         self._ready_ops.discard(op_id)
@@ -479,14 +585,32 @@ class TransferOpGraph:
         self._ready_ops.update(to_add)
         return ready_ops
 
+    # 整图是否所有 op 都已完成。数据面调度器在每轮 take_ready_ops() 之后调用它，
+    # 为真则把图从 _transfer_graphs 中移除并上报"图完成"。
     def all_transfer_ops_completed(self) -> bool:
         """check if all transfer ops are completed"""
         return all(op.status == TransferOpStatus.COMPLETED
                    for op in self._op_map.values())
 
+    # GPU block id 的"晚绑定"入口，整个文件最需要小心的一个函数。
+    #
+    # 为什么需要它：建图时（控制面）推理引擎还没分配显存槽位，GPU 侧 block id
+    # 只能是空数组；等 vLLM 调度器给出 slot_mapping 后，kvtask 才调用本函数
+    # 把真实 id 填进去（见 kvtask.py 的 set_gpu_blocks(graph_ids, swa_graph_ids)）。
+    #
+    # 参数含义：
+    #   gpu_blocks     —— 全量 KV 的 GPU slot id 数组（由 slot_mapping 换算而来）
+    #   swa_gpu_blocks —— SWA 池的 GPU slot id 数组；传 None 表示"本次不重绑 SWA op"，
+    #                     保留建图时已填好的值（kvtask 的两步调用路径依赖这个语义）
+    #
+    # 分配方式：按 _gpu_transfer_op_id 的顺序，各 op 依次从数组头部（或尾部，见下方
+    # 行内注释）切走自己需要的那一段，所以调用方传入的数组元素个数与顺序必须和
+    # 建图时 op 的顺序严格对应。
     def set_gpu_blocks(self,
                        gpu_blocks: np.ndarray,
                        swa_gpu_blocks: Optional[np.ndarray] = None) -> None:
+        # SWA 侧独立计数：SWA op 从 swa_gpu_blocks 里按自己的顺序切分，
+        # 与全量 KV 侧的切分互不相干（两者 slot id 空间本来就不同）。
         swa_offset = 0
         for op_id in self._gpu_transfer_op_id:
             op = self._op_map[op_id]
@@ -508,6 +632,10 @@ class TransferOpGraph:
                     )
                 target_gpu_blocks = swa_gpu_blocks[swa_offset:next_swa_offset]
                 swa_offset = next_swa_offset
+            # 目的端是 GPU 的类型（name 以 "2D" 结尾）填 dst，源端是 GPU 的填 src。
+            # 切段方式分两种：GDS 直连 GPU 的 DISK2D / D2DISK 取数组**尾段**，
+            # H2D / D2H 取**头段** —— 这是上游传入 gpu_blocks 时既有的布局约定，
+            # 改动前务必先确认 transfer_manager 侧数组是怎么拼的。
             if transfer_type.name.endswith("2D"):
                 if transfer_type == TransferType.DISK2D:
                     op.dst_block_ids = target_gpu_blocks[-op.dst_block_ids.size:]
@@ -573,10 +701,14 @@ class TransferOpGraph:
                 if op.src_block_ids.size > 0:
                     op.src_block_ids = np.array([], dtype=op.src_block_ids.dtype)
 
+    # 图内 op 总数。空图（num_ops == 0）在控制面表示"无需任何传输"。
     @property
     def num_ops(self) -> int:
         return len(self._op_map)
 
+    # 调试用：把整张图（每个 op 的类型/状态/依赖/block id 摘要 + 当前 ready 集合）
+    # 打印成 ASCII 表格并返回字符串。状态符号 ○=PENDING ◐=RUNNING ●=COMPLETED。
+    # 排障时最有用的一个入口：直接看 predecessors 是否为空就能判断 op 卡在哪。
     def visualize(self) -> str:
         """
         Visualize the transfer op graph in a readable format.
@@ -654,6 +786,10 @@ class TransferOpGraph:
         print(result)
         return result
 
+# 批融合时会把 N 个小 op 拼成 1 个大 op，但每个小 op 的回调仍需独立触发。
+# 本函数把 N 个回调合成一个：大 op 完成时拿到整体 CompletedOp，
+# 再按 block_spans 里记的 (offset, count) 切出各子 op 的那一段，分别回调。
+# 返回的 CompletionAwareCallback 保证子回调能收到属于自己的 block_results。
 def _make_combined_callback(
     callbacks: List[Callable],
     block_spans: Optional[List[Tuple[int, int]]] = None,
@@ -673,6 +809,8 @@ def _make_combined_callback(
     return CompletionAwareCallback(combined_callback)
 
 
+# 给 op 挂回调：只有 1 个时直接挂原始回调（少一层包装、也少一次 slice 开销），
+# 多个时才退化到 _make_combined_callback。
 def _attach_combined_callback(op: TransferOp,
                               callbacks: List[Callable],
                               op_callback_dict: Dict[int, Callable]) -> None:
@@ -684,6 +822,10 @@ def _attach_combined_callback(op: TransferOp,
         op_callback_dict[op.op_id] = _make_combined_callback(callbacks)
 
 
+# 给合并后的大 op 挂回调，并记录每个源 op 在大 op 中的 block 区间。
+# 区间按 source_ops 的顺序累加得到：第 i 个源 op 占 [offset, offset+len(src_block_ids))。
+# 大 op 的 block 顺序与 source_ops 顺序一致（见 _merge_ops 的 np.concatenate），
+# 所以这里的 offset 累加必须和那里的拼接顺序完全对齐。
 def _attach_merged_callbacks(
     merged_op: TransferOp,
     source_ops: List[TransferOp],
@@ -712,6 +854,12 @@ def _attach_merged_callbacks(
             merged_callbacks, block_spans)
 
 
+# 把若干个"并行终点 op"收敛成一个终点 op，供上层当作"任务结束标志"使用：
+#   0 个终点 -> 返回 -1（表示本图没有任何需要等待的东西）
+#   1 个终点 -> 直接返回它，不浪费一个 VIRTUAL 节点
+#   N 个终点 -> 新建一个 VIRTUAL op 并依赖它们全部
+# VIRTUAL op 不搬数据，调度器取到即完成，因此它天然是"N 路汇合"的同步点。
+# 控制面的典型调用点：cache_engine.py 里 GET 路径汇合 H2D(main) + H2D(swa) 两条分支。
 def add_virtual_op_for_multiple_finished_ops(
     graph: TransferOpGraph,
     finished_ops_ids: List[int],
@@ -736,6 +884,13 @@ def add_virtual_op_for_multiple_finished_ops(
     return graph, op.op_id
 
 
+# 把同类型的一批 op 合并成一个大 op：block id 直接 np.concatenate，
+# mooncake 的 block hash 也按相同顺序拼接（H2REMOTE / REMOTE2H 用得上）。
+# 合并的目的：批调度时把 N 个请求的小 op 压成 1 个大 op，减少跨进程派发与调度开销。
+# 两条硬约束（违反直接抛错）：
+#   1. 不收 SWA op —— SWA 走 _merge_swa_ops，因为它用的是另一套 tail-hash 字段；
+#   2. 同一批里不允许"有 hash 的 op"和"没 hash 的 op"混在一起 ——
+#      否则拼接出的 hash 数组长度对不上 block 数，C++ 侧无法按 block 对齐。
 def _merge_ops(ops: List[TransferOp], transfer_type: TransferType,
                graph: TransferOpGraph,
                callbacks: List[Tuple[TransferOp, Callable]],
@@ -835,11 +990,15 @@ def _merge_swa_ops(ops: List[TransferOp], transfer_type: TransferType,
     return merged_op
 
 
+# _bucket_has：判断给定的若干 TransferType 桶里是否有活儿（主 KV 或 SWA 任一即可）。
+# 批融合靠它区分这批图是 GET 流（DISK2H/REMOTE2H -> H2D）还是 PUT 流（D2H -> H2DISK/H2REMOTE）。
 def _bucket_has(*types: TransferType, ops_by_type: Dict[TransferType, List[TransferOp]],
                      swa_ops_by_type: Dict[TransferType, List[TransferOp]]) -> bool:
     return any(ops_by_type[t] or swa_ops_by_type[t] for t in types)
 
 
+# _pick_dp_client_id：给批图挑一个 dp_client_id。优先取 H2D/D2H 首个 op 的，
+# 因为这两类 op 直接对应 GPU 所在的 DP 组；都没有时退回 0。
 def _pick_dp_client_id(ops_by_type: Dict[TransferType, List[TransferOp]],
                        swa_ops_by_type: Dict[TransferType, List[TransferOp]]) -> int:
     for tt in (TransferType.H2D, TransferType.D2H):
@@ -850,6 +1009,8 @@ def _pick_dp_client_id(ops_by_type: Dict[TransferType, List[TransferOp]],
     return 0
 
 
+# 批图的"汇合点"。与 add_virtual_op_for_multiple_finished_ops 语义相同，
+# 区别是这里会先过滤掉 None / -1（批融合时某些通路可能整条不存在，对应 op 就是 None）。
 def _add_batch_sink(graph: TransferOpGraph, terminals: List[int],
                     dp_client_id: int) -> int:
     """Materialize the batch sink.
@@ -921,6 +1082,7 @@ def merge_to_batch_graph(batch_id: int,
         raise ValueError(
             "transfer_graphs and task_end_op_ids must have the same length")
 
+    # 新图会拿到一个自增的新 graph_id；形参 batch_id 目前不参与实现。
     merged_graph = TransferOpGraph()
 
     ops_by_type: Dict[TransferType, List[TransferOp]] = {}
@@ -931,12 +1093,15 @@ def merge_to_batch_graph(batch_id: int,
                        TransferType.D2H, TransferType.H2DISK,
                        TransferType.H2REMOTE, TransferType.REMOTE2H}
 
+    # 四个桶按 TransferType 分门别类收集：主 KV / SWA 各一套，op 与它的回调各一套。
     for tt in supported_types:
         ops_by_type[tt] = []
         callbacks_by_type[tt] = []
         swa_ops_by_type[tt] = []
         swa_callbacks_by_type[tt] = []
 
+    # 第一遍扫描：把所有输入图的 op 按类型丢进桶里。原图的依赖边在这里被丢弃，
+    # 依赖关系统一由下面的"GET / PUT 固定骨架"按类型重新建立。
     for graph in transfer_graphs:
         for op_id, op in graph._op_map.items():
             if op.transfer_type == TransferType.VIRTUAL:
@@ -982,6 +1147,11 @@ def merge_to_batch_graph(batch_id: int,
     dp_client_id = _pick_dp_client_id(
         ops_by_type=ops_by_type, swa_ops_by_type=swa_ops_by_type)
 
+    # ---- GET 分支骨架 -------------------------------------------------------
+    #   REMOTE2H ─┐                    REMOTE2H(swa) ─┐
+    #   DISK2H  ──┼─> H2D (sink)       DISK2H(swa)  ──┼─> H2D(swa) (sink)
+    # 两条 lane（主 KV / SWA）彼此独立并行，最后用 batch sink 汇合。
+    # layerwise 模式下，本地的 DISK2H + H2D 会被折叠进单个 LAYERWISE op。
     if has_get:
         merged_disk2h_op = _merge_ops(
             ops_by_type[TransferType.DISK2H], TransferType.DISK2H,
@@ -1102,6 +1272,10 @@ def merge_to_batch_graph(batch_id: int,
             batch_end_op_id = _add_batch_sink(
                 merged_graph, get_sinks, dp_client_id)
 
+    # ---- PUT 分支骨架（GET 的镜像）------------------------------------------
+    #   D2H ──┬─> H2DISK              D2H(swa) ──┬─> H2DISK(swa)
+    #         └─> H2REMOTE                       └─> H2REMOTE(swa)
+    # 这里 D2H 才是汇合点：必须先从 GPU 拷到 CPU，才能再落盘/上远端。
     elif has_put:
         merged_d2h_op = _merge_ops(
             ops_by_type[TransferType.D2H], TransferType.D2H,
@@ -1167,6 +1341,9 @@ def merge_to_batch_graph(batch_id: int,
 
 
 
+# NVTX 打点用的颜色（Nsight Systems 时间线上区分不同 op）。
+# get_nvtx_range_color 用黄金比例哈希把任意整数稳定映射到一个颜色值，
+# 保证同一个 op_id 每帧拿到同一颜色，视觉上可追踪。
 def get_nvtx_default_color() -> int:
     return 0xD3D3D3
 

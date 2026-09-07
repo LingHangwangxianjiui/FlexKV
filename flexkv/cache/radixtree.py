@@ -34,6 +34,75 @@ This module is the non-accel mirror; DSv4 uses the C++ CRadixTreeIndex. Kept
 method-for-method equivalent so the pure-Python path can be unit-tested without
 torch/GPU (see tests/test_swa_node_mount.py).
 """
+# ==============================================================================
+# flexkv/cache/radixtree.py —— 纯 Python 实现的前缀索引（Radix Tree）
+# ------------------------------------------------------------------------------
+# 本文件职责：维护「token 前缀哈希序列 -> 物理 block 编号」的映射，回答一个
+#   问题：「一个新来的请求，和已经缓存的内容最长能复用多少个 block？」
+#   这是 KV Cache 复用（prefix caching）的核心数据结构。
+#
+# 为什么用 Radix Tree 而不是哈希表：
+#   KV Cache 可复用的前提是「从第一个 token 起的连续公共前缀」——Transformer
+#   的注意力是因果的，第 k 个 token 的 K/V 依赖它前面所有 token，所以只有前缀
+#   相同才可复用，中间相同不算。哈希表只能做全等查询（整条命中或不命中），
+#   既表达不了「部分命中了多少个 block」，也无法在命中一半时把已有条目切成
+#   两段。Radix Tree（压缩前缀树）天然提供三件哈希表给不了的东西：
+#     1. 最长前缀匹配：沿树一次下降就得到最长公共前缀（见 match_prefix），
+#        复杂度只与命中深度有关，与树上总条目数无关；
+#     2. 按任意位置切分：新请求在第 k 个 block 分叉时，把原节点 split 成
+#        [0,k) 与 [k,n) 两段共享前缀（见 RadixNode.split）；
+#     3. 前缀共享：N 条同前缀序列只存一份公共前缀，既省内存，也让「按前缀
+#        聚合淘汰」成为可能——删掉一个叶子就只释放它独占的那段后缀。
+#   节点里存的不是 token 本身，而是前缀哈希（common/hash_utils.py 的
+#   gen_hashes，XXH64，与 C++ 侧 csrc/hash.cpp 同一算法），因此比较一整段
+#   只需比哈希；部分匹配的边用二分查找定位首个不同的 block（见 match_prefix
+#   里的 left/right），不是逐块线性扫。
+#
+# 在系统链路中的位置（控制面 / 纯 CPU 元数据路径）：
+#   KVManager -> KVTaskEngine -> GlobalCacheEngine
+#     -> CacheEngine（cache/cache_engine.py:603，用【本文件】的 RadixTreeIndex）
+#        或 CacheEngineAccel（cache_engine.py:272，用 C++ 版 CRadixTreeIndex）
+#     -> Mempool（cache/mempool.py，只记账物理块空闲与否）
+#   本文件不参与任何数据搬运：它只回答「哪些 block 可复用 / 可被淘汰」，
+#   真正的拷贝由 TransferEngine 执行。
+#
+# 核心内容速查：
+#   - MatchResult    : match_prefix 的返回值（命中块数、ready 块数、插入锚点
+#                      节点、命中的 physical_blocks、SWA 命中）
+#   - RadixNode      : 树节点，持有一段连续的 block_hashes 及其 physical_blocks，
+#                      外加锁计数、热度（grace_time / hit_count）与 SWA 挂载态
+#   - RadixTreeIndex : 树本体，五套语义：
+#       match_prefix  : 最长前缀匹配（读路径，决定能复用多少 KV）
+#       insert        : 把写好的 (hash 段 -> blocks) 挂上树（写路径）
+#       evict         : 按策略（lru/lfu/slru/fifo/mru/filo）淘汰叶子回收 block
+#       lock / unlock : 引用计数锁，保护正在使用的节点不被淘汰
+#       set_ready     : 标记数据真正落位，此后才可被命中（延迟可见）
+#     以及 SWA（滑动窗口注意力）一整套：set_swa / promote_swa / evict_swa /
+#     inc_lock_ref / dec_lock_ref / drain_freed_swa_slots
+#
+# 阅读提示 / 常见坑：
+#   1. 【为什么要有 ready 状态】写入是异步的：规划阶段就先 insert 上树占位
+#      （is_ready=False），等传输完成回调再 set_ready。因此节点可能「可见但
+#      不可读」。match 同时给出 num_matched_blocks（含未 ready）与
+#      num_ready_matched_blocks（真能读），调用方一律按 ready 数量切分。
+#   2. 【为什么需要 lock】从 match 到传输完成的整个窗口内，命中的节点可能
+#      被别人触发的 evict 踢掉，导致读到脏块或写坏别人的块。lock_cnt 让
+#      evictable() 为 False 从而保住它。注意本文件的 lock() 只锁单个节点，
+#      而 inc_lock_ref 会沿 [node, root) 整条路径加锁——因为父节点被删会
+#      连带删掉子树。
+#   3. 【淘汰的分工】Mempool 决定「什么时候需要淘汰」（利用率超阈值 / 本次
+#      需求大于空闲数），本文件的 evict 决定「淘汰谁」（按策略挑叶子），
+#      最后由 Mempool.recycle_blocks 真正回收。两者必须严格配对，否则会
+#      出现双份释放或 block 泄漏。
+#   4. 【split 的隐含约定】split 出的新节点 lock_cnt 从 0 开始、不继承，
+#      代码注释写明 "only lock near-leaf node"：锁只加在叶子附近。
+#   5. 【与 C++ 版的关系】本文件是 csrc/radix_tree.cpp 的 Python 镜像，方法
+#      逐一对齐，目的之一是让 SWA 逻辑能在没有 GPU/torch 的环境下跑单测
+#      （tests/test_swa_node_mount.py）。生产路径 CacheEngineAccel 走 C++。
+#   6. 本文件内部不加锁，并发安全由调用方 CacheEngine 的
+#      _synchronized_cache_tree 装饰器保证。
+# ==============================================================================
+
 import heapq
 import time
 from dataclasses import dataclass, field
@@ -47,8 +116,21 @@ from flexkv.common.hash_utils import HashType, Hasher
 from flexkv.common.transfer import DeviceType
 
 
+# match_prefix 的结果。字段分三类：
+#   * 数量：num_matched_blocks（含未 ready 的全部命中）/ num_ready_matched_blocks
+#     （真能立即读的前缀长度，见 match_prefix 里关于「前缀长度而非计数」的注释）
+#   * 锚点：last_node + last_node_matched_length 描述匹配终止的位置，insert 直接
+#     以它为起点挂新节点（省一次查找）；last_ready_node 是最后一个全命中的
+#     ready 节点
+#   * 数据：physical_blocks 是命中路径上各节点 physical_blocks 的拼接，调用方
+#     拿它直接构造传输 DAG
 @dataclass
 class MatchResult:
+    """一次前缀匹配的结果，同时作为 insert 的锚点（见 insert 的 match_result 参数）。
+
+    在链路中的职责：由 CacheEngine.match 产出，交给 GlobalCacheEngine 决定
+    「哪些 block 可以直接复用、哪些要重算 / 从下级存储拉」，再传给 insert 复用。
+    """
     num_ready_matched_blocks: int = 0
     num_matched_blocks: int = 0
     matched_pos: str = "local"
@@ -70,8 +152,31 @@ class MatchResult:
     def is_empty(self) -> bool:
         return self.num_matched_blocks == 0
 
+# 树节点 = 一段连续的 block（边），而不是单个 block。
+# 这是 radix tree「压缩」的含义：把一串只有单一孩子的节点合并成一条边，
+# 节点内 block_hashes[i] 与 physical_blocks[i] 一一对应（__post_init__ 断言
+# 两者等长）。分裂（split）/ 收缩（shrink）都是对这两个数组做切片。
+# 对应 C++ 侧的 CRadixNode。
 @dataclass
 class RadixNode:
+    """Radix Tree 上的一个节点（一段连续的 block），对应 C++ 的 CRadixNode。
+
+    在链路中的职责：索引的最小单元。它只记录「这段前缀哈希对应哪些物理
+    block」以及用于淘汰的元信息，不持有任何真实 KV 数据。
+
+    关键设计：
+        block_hashes / physical_blocks  : 两条等长的 int64 数组，按下标一一对应。
+                                          前者是索引键（前缀哈希），后者是值
+                                          （本 tier 的物理 block 编号）。
+        children                        : 见下方字段注释——按「孩子首 block 的
+                                          前缀哈希」索引的 dict，等价于 C++ 的
+                                          unordered_map。
+        is_ready / lock_cnt             : 可见性与引用计数，决定 evictable()。
+        grace_time / hit_count / *_time : 淘汰策略的输入，由 _get_eviction_priority
+                                          按策略读取。
+        swa_*                           : SWA（滑动窗口注意力）快照的挂载状态，
+                                          见文件头与 SWA 相关方法。
+    """
     block_hashes: np.ndarray
     physical_blocks: np.ndarray
 
@@ -82,7 +187,13 @@ class RadixNode:
     creation_time: float = 0.0
     last_access_time: float = 0.0
 
+    # 只有父指针：节点不知道自己在树的哪一层，也无法从叶子反查整条序列，
+    # 因此「从某叶子往上走到根」是唯一的方向（inc_lock_ref / set_ready 都靠它）。
     parent: Optional['RadixNode'] = None
+    # 孩子按「该孩子第一个 block 的前缀哈希」索引（等价于 C++ 侧的
+    # unordered_map<HashType, CRadixNode*>）。用哈希而非 token 作键，查找是
+    # O(1) 且无需在节点里保存原始 token。节点本身不含自己的首哈希，需要时
+    # 由 head_hash() 现算 block_hashes[0]。
     children: Dict[Optional[HashType], 'RadixNode'] = field(default_factory=dict)
 
     # ===== SWA (node-mounted) state — mirrors CRadixNode =====
@@ -101,12 +212,18 @@ class RadixNode:
         assert self.block_hashes.size == self.physical_blocks.size
 
     def __lt__(self, other: 'RadixNode') -> bool:
+        """仅为 heapq 兜底比较：dataclass 默认不可比较，当 (priority, node) 的
+        priority 相等时，heapq 会继续比 node，此时按 grace_time 定序。"""
         return self.grace_time < other.grace_time
 
     def size(self) -> int:
         return self.block_hashes.size
 
     def head_hash(self) -> HashType:
+        """本节点第一个 block 的前缀哈希，即它在父节点 children 里的键。
+
+        空节点（root）返回 0——root 不参与 children 索引，所以这是个安全兜底。
+        """
         return HashType(int(self.block_hashes[0])) if self.size() > 0 else HashType(0)
 
     def num_children(self) -> int:
@@ -119,9 +236,21 @@ class RadixNode:
         return self.parent is None
 
     def evictable(self) -> bool:
+        """本节点是否可被淘汰：非 root、是叶子、且未被占用。
+
+        只淘汰叶子是 radix tree 的基本约束——内部节点被所有子孙共享，删掉它
+        会连带丢掉别人的前缀。所以 evict 删掉一个叶子后，要把因此变成叶子的
+        父节点重新塞回候选堆（见 RadixTreeIndex.evict）。
+        """
+        # 只有叶子可淘汰：内部节点承载子孙共享的前缀，删了会连坐
         return not self.is_root() and self.is_leaf() and not self.in_use()
 
     def in_use(self) -> bool:
+        """是否被占用（不可淘汰）：被 Full 锁 / 被 SWA 锁 / 尚未 ready。
+
+        最后一项是「延迟上树」的另一半保障：正在写入、数据还没落位的节点绝不能
+        被淘汰，否则它的 physical_blocks 会被回收给别人，传输却还在往里写。
+        """
         # A node is in use (not full-evictable) if its Full KV is locked, its SWA
         # is locked (I3: swa_lock_ref>0 implies it must stay), or it is not ready.
         return self.lock_cnt > 0 or self.swa_lock_ref > 0 or not self.is_ready
@@ -143,14 +272,39 @@ class RadixNode:
         self.swa_lock_ref -= 1
 
     def lock(self) -> None:
+        """加一次 Full-KV 引用锁（节点方法版本；树方法见 RadixTreeIndex.lock）。
+
+        锁是引用计数而非布尔，允许多个请求同时保护同一节点；只有降到 0 才
+        重新变得可淘汰。
+        """
         assert self.lock_cnt >= 0
         self.lock_cnt += 1
 
     def unlock(self) -> None:
+        """释放一次 Full-KV 引用锁。"""
         assert self.lock_cnt > 0
         self.lock_cnt -= 1
 
     def split(self, prefix_length: int) -> 'RadixNode':
+        """在 prefix_length 处把本节点切成两段，返回前半段（新父节点）。
+
+        Args:
+            prefix_length: 切分点，必须满足 0 < prefix_length < size()（即真正
+                的「部分匹配」；整段命中不需要切分）
+        Returns:
+            new_node：前缀半段 [0, prefix_length)，成为本节点的新父节点；
+                      本节点 self 保留后缀半段 [prefix_length, size())
+        Note:
+            这是 radix tree 相对哈希表的关键能力：新请求在节点中间分叉时不必
+            重建整条条目，切一刀就能让两段继续共享前缀。
+            两个隐含约定：
+              1. 新节点 lock_cnt 从 0 开始（锁只加在靠近叶子的节点上，内部
+                 节点理论上不该被锁住）；
+              2. SWA 留在 self 上（不变式 I0：SWA 属于节点最后一个 page，
+                 切分后最后一页仍归后缀半段所有）。
+            调用方（RadixTreeIndex.insert）在 split 后还需自行维护
+            leaf_nodes 字典——本方法只调整树结构与 parent / children 指针。
+        """
         assert prefix_length < self.size()
         assert prefix_length > 0
         assert self.parent is not None
@@ -176,6 +330,8 @@ class RadixNode:
         self.block_hashes = self.block_hashes[prefix_length:]
         self.physical_blocks = self.physical_blocks[prefix_length:]
 
+        # 指针重接：把 new_node 插到 self 与原父节点之间
+        # （原父 -> new_node -> self）。children 的键始终是孩子的 head_hash。
         self.parent.children[new_node.head_hash()] = new_node
         new_node.parent = self.parent
         self.parent = new_node

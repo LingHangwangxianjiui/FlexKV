@@ -1,3 +1,64 @@
+# ==============================================================================
+# 本文件职责：FlexKV 数据面的"搬运工"——真正把 KV Cache 字节从一处搬到另一处的执行体。
+#
+# 在系统链路中的位置（本文件属于【数据面 / 执行层】）：
+#   KVManager(kvmanager.py)
+#     -> KVTaskEngine(kvtask.py)                  任务编排 / 状态机
+#       -> GlobalCacheEngine(cache/cache_engine.py) 控制面：产出 TransferOpGraph(DAG)
+#         -> TransferEngine(transfer/transfer_engine.py) 数据面调度：DAG -> 单个 TransferOp
+#           -> 【本文件 Worker】                    真正搬字节（本文件）
+#             -> c_ext(csrc/bindings.cpp)          CUDA / io_uring / GDS / RDMA
+#
+# 组织方式（理解这点，这个 4000+ 行的文件就不难读）：
+#   ** 一个类 = 一条物理通路 **。
+#   每个 Worker 子类只负责"从 X 搬到 Y"这一件事，内部只做三件事：
+#     1) __init__ 里解析出 X 侧和 Y 侧的内存布局（stride / chunk_size / 指针数组）；
+#     2) _transfer_impl() 把 (src_block_ids, dst_block_ids) 翻译成一次 c_ext 调用；
+#     3) launch_transfer() 做流绑定、计时、可选压缩，然后返回结果。
+#   公共部分（进程生命周期、任务队列、完成回调、host memory pin/unpin）全部在
+#   TransferWorkerBase 里用"模板方法模式"实现，子类只填钩子。
+#
+# 核心内容速查（按文件中的出现顺序）：
+#   ┌── 基础 ─────────────────────────────────────────────────────────────────┐
+#   │ TransferWorkerBase        抽象基类：进程模型 / 任务循环 / 完成回调 / pin │
+#   │ WorkerHandle              父进程侧握着的句柄：submit / control / shutdown│
+#   └────────────────────────────────────────────────────────────────────────┘
+#   ┌── 主线（默认构建就生效，二次开发最先要读的四个）───────────────────────┐
+#   │ GPUCPUTransferWorker      GPU <-> CPU    : H2D / D2H                    │
+#   │ tpGPUCPUTransferWorker    GPU <-> CPU    : H2D / D2H（TP 多卡并行）     │
+#   │ CPUSSDDiskTransferWorker  CPU <-> SSD    : H2DISK / DISK2H (io_uring)   │
+#   │ (LayerwiseTransferWorker  GPU <-> CPU 分层流水，见同级 layerwise.py)    │
+#   └────────────────────────────────────────────────────────────────────────┘
+#   ┌── 旁支（需要编译宏 / 配置项才生效，默认不参与运行）────────────────────┐
+#   │ CPURemoteTransferWorker   CPU <-> 远端存储 : H2REMOTE / REMOTE2H        │
+#   │                           依赖 FLEXKV_ENABLE_CFS=1 编译（PCFS）         │
+#   │ GDSTransferWorker         GPU <-> SSD    : D2DISK / DISK2D（GPUDirect） │
+#   │ tpGDSTransferWorker       GPU <-> SSD    : D2DISK / DISK2D（TP 多卡）   │
+#   │                           依赖 FLEXKV_ENABLE_GDS=1 编译                 │
+#   │ NixlTransferWorker        GPU<->SSD(GDS_MT) 或 CPU<->SSD(POSIX/3FS)     │
+#   │                           依赖 NIXL 后端可用 + nixl_backend 配置        │
+#   │ PEER2CPUTransferWorker    跨机 对端CPU/SSD -> 本地CPU : PEERH2H/PEERSSD2H│
+#   │                           依赖 enable_kv_sharing + Mooncake + Redis      │
+#   │ MooncakeStoreTransferWorker CPU <-> Mooncake Store : H2REMOTE/REMOTE2H   │
+#   │                           依赖 mooncake store 客户端                     │
+#   └────────────────────────────────────────────────────────────────────────┘
+#
+# 进程模型（为什么是独立进程）：
+#   Worker 跑在 **独立子进程** 里，原因是搬 KV 会长时间占住 CUDA 上下文 / io_uring /
+#   RDMA 网卡，若与推理主进程同进程会阻塞 forward。父进程（TransferEngine）只握住
+#   WorkerHandle：通过 Pipe 下发任务、通过共享 MPQueue 回收完成事件。
+#   启动入口是类方法 TransferWorkerBase.create_worker -> _worker_process。
+#
+# 阅读提示 / 常见坑：
+#   1. 任何 CUDA 调用之前必须先 ensure_cuda_device()/import_tensor_handles()，否则
+#      每个 worker 都会在 GPU0 上建默认上下文，DP 场景下直接把 GPU0 撑爆。
+#   2. 通过 CUDA IPC 导入的 tensor **必须** 用 keepalive 列表持有（见各
+#      _multi_group_*_keepalive），C++ 侧只存了裸 data_ptr()，tensor 被 GC 后指针即悬空。
+#   3. 所有 c_ext 调用都是"同步"语义（sync=True / 内部等待 io_uring 完成），
+#      launch_transfer 返回即代表数据已落盘/落显存。
+#   4. 完成回调不走 Pipe 原路返回，而是 put 到共享的 finished_ops_queue，由
+#      TransferEngine._scheduler_loop 统一消费并回传 KVTaskEngine。
+# ==============================================================================
 import contextlib
 import logging
 import math
@@ -48,6 +109,9 @@ from flexkv.transfer.host_buffer import (
 )
 
 
+# 把当前进程绑到指定的 CUDA 设备。
+# 必须早于一切 CUDA API（cudaHostRegister / CUDA IPC 导入 / Stream 创建）调用，
+# 否则所有 worker 都会在 GPU0 上创建默认上下文。
 def ensure_cuda_device(device: Union[int, torch.device, None]) -> None:
     """Bind this process's CUDA context before IPC import / host register / Stream.
 
@@ -68,6 +132,8 @@ def ensure_cuda_device(device: Union[int, torch.device, None]) -> None:
     torch.cuda.set_device(idx)
 
 
+# 通过 CUDA IPC 句柄把父进程的 GPU KV tensor 映射进本 worker 进程。
+# 导入前先切到句柄所属设备，否则 IPC 映射会被建到 GPU0 上。
 def import_tensor_handles(
     handles: List["TensorSharedHandle"],
 ) -> List[torch.Tensor]:
@@ -77,6 +143,10 @@ def import_tensor_handles(
     return [h.get_tensor() for h in handles]
 
 
+# 多 group（异构 KV，如主 KV + DSA indexer）场景下的一致性校验：
+# 声明式 LayerGroupSpec 推导出的 chunk 字节数，必须与实际 GPU tensor 布局一致。
+# 典型反例：page-packed 的 indexer（tpb=1，一行 8448B）被描述成 tpb=64，
+# 若不拦截就会按错误 stride 提交给 c_ext，静默读错数据。
 def _validate_multi_group_chunk_layout(
     group_chunk_size: int,
     layout_chunk_size: int,
@@ -98,6 +168,9 @@ def _validate_multi_group_chunk_layout(
 
 
 
+# 把一个已映射的 KV 大池切成多个 Mooncake 内存区（MR）。
+# 背景：RDMA 传输对单块 MR 有大小上限（老版本 Mooncake 是 2 GiB），
+# 且不允许一次传输跨两个 MR —— 所以必须在不切开 KV block 的前提下切分。
 def _split_mooncake_registration_regions(
     base_ptr: int,
     logical_size: int,
@@ -151,8 +224,11 @@ def _split_mooncake_registration_regions(
         return [(base_ptr, mapped_size)]
 
     regions: List[Tuple[int, int]] = []
+    # 切分粒度取 block 大小、外部 size 对齐、hugepage 指针对齐三者的最小公倍数，
+    # 这样每个子 MR 的起点仍然 hugepage 对齐、长度仍然是整数个 KV block。
     region_unit = math.lcm(block_size, size_alignment, pointer_alignment)
     aligned_region_size = (max_mr_size // region_unit) * region_unit
+    # 若 MR 上限比一个对齐周期还小（极端配置），退化为"只保证 block 边界"的切法。
     use_block_boundary_fallback = aligned_region_size <= 0
 
     if use_block_boundary_fallback:
@@ -300,12 +376,38 @@ except ImportError:
 
 
 class TransferWorkerBase(ABC):
+    """所有 Worker 的抽象基类：进程模型、任务队列、完成回调、host memory 生命周期。
+
+    在链路中的职责：
+        TransferEngine 把 TransferOpGraph 拆成单个 TransferOp 后，通过 Pipe 发给某个
+        具体 Worker 子进程；本类提供"接收 -> 批量执行 -> 上报完成"这一公共骨架，
+        字节搬运本身交给子类。
+
+    关键设计 —— 模板方法模式：
+        子类必须实现的钩子：
+            - ``_transfer_impl()``  : 把 block id 列表翻译成一次底层（c_ext / RDMA）调用
+            - ``launch_transfer()`` : 单个 op 的入口（绑流、计时、压缩、返回成功与否）
+        子类可选复写的钩子：
+            - ``__init__``          : 解析两侧布局、建 io_uring / GDS / RDMA 上下文
+            - ``shutdown()``        : 释放外部资源（ZMQ / Mooncake / MR），必须回去调 super()
+            - ``_control_xxx()``    : 扩展控制面指令（见 ``_handle_control``）
+        基类已经固化、子类不要动的：
+            ``create_worker`` / ``_worker_process`` / ``run`` / ``shutdown`` 的 pin-unpin 部分
+
+    两条通信通道：
+        - 下行：``transfer_conn``（Pipe 的收端），父进程 ``WorkerHandle`` 发 WorkerTransferOp；
+                ``None`` 是优雅退出哨兵；dict 且 ``type=="control"`` 是控制面指令。
+        - 上行：``finished_ops_queue``（多进程共享 Queue），完成/失败都往里 put。
+    """
     _worker_id_counter = 0
     _worker_id_lock = threading.Lock()
 
     def __new__(cls, *args: Any, **kwargs: Any):
+        """在 __init__ 之前就把 shutdown() 需要的状态准备好（见下方注释）。"""
         # Allocate first so ``_worker_process`` can always hold a reference and
         # call shutdown() even when ``__init__`` fails mid-way after some pins.
+        # 中文要点：__init__ 可能 pin 了一半就抛异常，此时 _worker_process 的 finally
+        # 仍能拿到引用并调用 shutdown() 安全回滚，所以这些状态必须在 __new__ 里就绪。
         obj = super().__new__(cls)
         obj._host_registered = []
         obj._shutdown_done = False
@@ -317,6 +419,14 @@ class TransferWorkerBase(ABC):
                  transfer_conn: Connection,  # receive end of pipe
                  finished_ops_queue: MPQueue,
                  op_buffer_tensor: torch.Tensor):
+        """子进程侧的初始化。子类 __init__ 必须先 super() 再碰任何 CUDA/IO 资源。
+
+        Args:
+            worker_id: 全局自增的 worker 编号（仅用于日志与 trace）
+            transfer_conn: Pipe 收端，接收 WorkerTransferOp / 控制指令 / None 哨兵
+            finished_ops_queue: 跨进程共享队列，用于把完成事件回传给 TransferEngine
+            op_buffer_tensor: 共享的 block id 缓冲（pinned），避免每个 op 都拷一次 id 数组
+        """
         self.worker_id = worker_id
         self.transfer_conn = transfer_conn  # receive end of pipe
         self.finished_ops_queue: MPQueue = finished_ops_queue
@@ -328,7 +438,13 @@ class TransferWorkerBase(ABC):
         self._shutdown_done = False
 
     def _register_host_tensor(self, tensor: torch.Tensor, label: str = "") -> None:
-        """cudaHostRegister and track for paired unregister in shutdown()."""
+        """cudaHostRegister and track for paired unregister in shutdown().
+
+        中文要点：把 tensor 锁页（pin）并登记到 _host_registered，
+        shutdown() 时会逆序一一 unregister。所有需要被 CUDA DMA 直接访问的
+        CPU 内存（KV 池、op_buffer、NIXL CPU 池）都必须走这里，不能裸调
+        cudaHostRegister，否则进程退出时会漏解绑、把物理内存永久钉死。
+        """
         size_gb = tensor.numel() * tensor.element_size() / (1024 ** 3)
         flexkv_logger.info(
             f"[worker {self.worker_id}] cudaHostRegister {label or 'host'}: "
@@ -342,6 +458,9 @@ class TransferWorkerBase(ABC):
 
         Must not run before ``ensure_cuda_device`` / ``import_tensor_handles``,
         or every worker creates a default CUDA context on GPU0.
+
+        中文要点：必须在 ensure_cuda_device() / import_tensor_handles() 之后调用，
+        因为 cudaHostRegister 会隐式初始化 CUDA 上下文，提前调用会建在 GPU0 上。
         """
         if not self._op_buffer_pinned:
             self._register_host_tensor(self.op_buffer_tensor, "op_buffer")
@@ -352,6 +471,9 @@ class TransferWorkerBase(ABC):
 
         Safe to call after a partially-failed ``__init__`` (only unregisters
         whatever was tracked in ``_host_registered``).
+
+        中文要点：幂等，且对"__init__ 中途失败"也安全——只解绑已经登记的区域。
+        子类的 shutdown() 应先释放自己的外部资源，再调用 super().shutdown()。
         """
         if getattr(self, "_shutdown_done", False):
             return
@@ -366,6 +488,7 @@ class TransferWorkerBase(ABC):
         # Drain in-flight CUDA work before unpinning host memory that
         # DMA / kernels may still be touching.
         #
+        # 解绑前先排空在途 CUDA 工作（sync 会被包一个有超时上限的守护线程，见下）。
         # torch.cuda.synchronize() releases the GIL and blocks in the driver;
         # if the GPU is wedged (hung kernel, TDR, faulty NVLink) it can hang
         # forever. We run it in a daemon thread with a bounded join so a
@@ -386,6 +509,10 @@ class TransferWorkerBase(ABC):
 
         Returns whether the sync actually completed. Failure / timeout is
         logged but not raised — unpin must proceed either way.
+
+        中文要点：GPU 挂死（hung kernel / TDR）时 synchronize 会永久阻塞，
+        所以放进守护线程并限时等待；超时也照常继续 unpin，因为 DMA 背后的
+        kernel 进程本身已经要死了，线程随进程一起退出即可。
         """
         if not (torch.cuda.is_available() and torch.cuda.is_initialized()):
             return
@@ -420,12 +547,18 @@ class TransferWorkerBase(ABC):
 
     @classmethod
     def _get_worker_id(cls) -> int:
+        """在父类进程侧自增地分配 worker 编号。需要加锁：create_worker 可能被多线程并发调用。"""
         with cls._worker_id_lock:
             worker_id = cls._worker_id_counter
             cls._worker_id_counter += 1
             return worker_id
 
     def _get_layer_ptrs(self, layer_blocks: Union[List[torch.Tensor], torch.Tensor]) -> torch.Tensor:
+        """把每层 KV tensor 的起始地址收集成一个 int64 的 pinned CPU 张量。
+
+        c_ext 侧要的就是这个"指针数组"（见 bindings.cpp 里的 gpu_tensor_ptrs，
+        要求 contiguous）。用 pinned memory 保证跨进程/跨设备拷贝时可直接 DMA。
+        """
         if isinstance(layer_blocks, torch.Tensor):
             layer_blocks = [layer_blocks]
         layer_ptrs = torch.zeros(
@@ -453,6 +586,10 @@ class TransferWorkerBase(ABC):
           triton/flashinfer: [num_blocks, 2, block_size, num_kv_heads, head_size]
 
         Returns (gpu_kv_stride_bytes, gpu_block_stride_bytes, gpu_layer_stride_bytes).
+
+        中文要点：不同 attention 后端 5D tensor 的维度顺序不同，靠"哪个维度 size==2
+        （K/V）、哪个维度 size==tokens_per_block（block）"反推，比硬编码布局更稳。
+        推断不出来时返回 None，调用方回退到 layout 声明的 stride。
         """
         if kv_dim == 1 or tensor.ndim != 5:
             return None  # caller should fall back to layout-based strides
@@ -491,8 +628,13 @@ class TransferWorkerBase(ABC):
                       finished_ops_queue: MPQueue,
                       op_buffer_tensor: torch.Tensor,
                       *args: Any, **kwargs: Any) -> 'WorkerHandle':
-        """Generic worker creation template method."""
+        """Generic worker creation template method.
 
+        在父进程侧执行：建 Pipe -> 起子进程 -> 返回 WorkerHandle。
+        子进程 target 是类方法 ``cls._worker_process``（可 pickle），
+        finished_ops_queue 与 op_buffer_tensor 都是可跨进程继承的共享对象。
+        ready_event 用于等子进程 __init__ 完成后再继续，避免提任务时还没初始化完。
+        """
         parent_conn, child_conn = mp_ctx.Pipe()  # create pipe
         ready_event = mp_ctx.Event()
         worker_id = cls._get_worker_id()
@@ -510,6 +652,17 @@ class TransferWorkerBase(ABC):
     @classmethod
     def _worker_process(cls, worker_id: int, transfer_conn: Connection, finished_ops_queue: MPQueue,
                         op_buffer_tensor: torch.Tensor, ready_event: Any, *args: Any, **kwargs: Any) -> None:
+        """Worker 子进程的入口（在子进程里执行）。
+
+        启动流程：
+            1. 装信号处理器：忽略 SIGINT（避免与推理主进程抢 Ctrl+C 导致 unpin 被打断、
+               pinned 内存泄漏），SIGTERM 转成 SystemExit 走 finally 做优雅清理；
+            2. 用 ``cls.__new__`` + ``__init__`` 而不是 ``cls(...)`` 构造：
+               这样即使 __init__ 抛异常也能持有引用，finally 里照样能 shutdown()；
+            3. ready_event.set() 通知父进程"已就绪"；
+            4. worker.run() 进入任务循环；
+            5. finally 里统一 shutdown() —— **唯一的** 一次清理，run() 内部不再自行清理。
+        """
         # Note: MPI initialization prevention is handled by create_safe_process
         # Environment variables are set before this function is called.
         #
@@ -569,6 +722,17 @@ class TransferWorkerBase(ABC):
         transfer_type: TransferType,
         **kwargs: Any
     ) -> None:
+        """子类必须实现：把 (src_block_ids, dst_block_ids) 翻译成一次底层字节搬运。
+
+        Args:
+            src_block_ids / dst_block_ids: int64 的 block id 列表，一一对应，
+                长度即本次要搬的 block 数（可能来自共享 op_buffer 的切片）
+            transfer_type: 决定 src/dst 谁是 GPU、谁是 CPU/SSD/远端
+            **kwargs: 个别通路有额外参数（如 CPURemote 的 src_block_node_ids、
+                NIXL 的 layer_id / layer_granularity）
+        Note:
+            约定是"同步"语义：返回时数据必须已经落到位（c_ext 内部 sync=True）。
+        """
         pass
 
     def get_transfer_block_ids(self,
@@ -581,6 +745,10 @@ class TransferWorkerBase(ABC):
             pinned: whether to pin the block ids tensor
         Returns:
             tuple[torch.Tensor, torch.Tensor]: src_block_ids and dst_block_ids
+
+        中文要点：slot_id >= 0 表示 id 数组已经在共享 op_buffer 里（父进程写好的），
+        这里只做零拷贝切片；slot_id == -1 表示 id 随 op 传过来（numpy），
+        需要现场转 int64 并 pin——因为 c_ext 会拿它做 DMA/设备侧索引。
         """
         src_slot_id = transfer_op.src_slot_id
         dst_slot_id = transfer_op.dst_slot_id
@@ -609,6 +777,8 @@ class TransferWorkerBase(ABC):
                                   end_time: float,
                                   uncompressed_size: Optional[int] = None) -> None:
         """Emit one terminal record per transfer op."""
+        # 这是一条结构化日志（[FlexKV-IO]），供外部采集 IO 带宽/压缩比；
+        # 因此先判 is_enabled_for，避免关掉日志时还白算一遍。
         if not flexkv_logger.is_enabled_for(logging.INFO):
             return
         duration_s = max(end_time - start_time, 1e-9)
@@ -663,9 +833,26 @@ class TransferWorkerBase(ABC):
     def launch_transfer(
         self, transfer_op: WorkerTransferOp
     ) -> Union[bool, WorkerTransferResult]:
+        """子类必须实现：执行一个 op 并返回结果。
+
+        典型实现：取 block ids -> 绑 CUDA stream -> 计时 -> 调 _transfer_impl()
+        -> 打性能日志 -> 返回 True/False。
+
+        Returns:
+            bool: True 成功 / False 失败（大多数通路）
+            WorkerTransferResult: 支持"部分成功"的后端（如 Mooncake）用逐 block 结果
+        Note:
+            由基类的 run() 调用；返回值决定往 finished_ops_queue 里 put 什么。
+        """
         pass
 
     def _handle_control(self, command: str, payload: Any) -> Any:
+        """控制面指令分发：把 command 映射到 ``_control_<command>`` 方法。
+
+        例如 ``suspend_gpu`` -> ``_control_suspend_gpu``，用于 GPU 热重映射
+        （把 VMM 映射释放掉，让别的进程/显存策略接管，再 resume 回来）。
+        子类只要定义同名钩子即可扩展，不需要改这里。
+        """
         handler = getattr(self, f"_control_{command}", None)
         if handler is None:
             raise NotImplementedError(
@@ -674,6 +861,12 @@ class TransferWorkerBase(ABC):
         return handler(payload)
 
     def _reply_control(self, op: Dict[str, Any]) -> None:
+        """执行控制指令并把结果（或异常）沿 Pipe 回给 WorkerHandle.control()。
+
+        与数据面不同：控制面是**同步请求-应答**，结果从 transfer_conn 原路发回，
+        而不是走 finished_ops_queue。异常不能抛出（否则会打断 run 循环），
+        只能塞进 reply["error"] 交给调用方决定。
+        """
         request_id = op["request_id"]
         try:
             reply = {
@@ -818,14 +1011,43 @@ class TransferWorkerBase(ABC):
                 flexkv_logger.error(f"Error in worker run loop: {e}")
 
 class WorkerHandle:
-    """handle for worker process"""
+    """handle for worker process
+
+    在链路中的职责（父进程侧的唯一入口）：
+        TransferEngine 不直接碰子进程，只握住这个句柄。
+        ┌── 下行（本句柄 -> 子进程）──────────────────────────────┐
+        │ submit_transfer() : 通过 Pipe 发 WorkerTransferOp（异步，不等待）│
+        │ control()         : 发 dict 控制指令并**阻塞等待**应答（同步）   │
+        │ shutdown()        : 发 None 哨兵 -> join -> 超时则 terminate/kill│
+        └────────────────────────────────────────────────────────┘
+        上行（子进程 -> 引擎）不经过本句柄：worker 把完成事件直接 put 到
+        共享的 finished_ops_queue，由 TransferEngine._scheduler_loop 消费。
+
+    关键设计：
+        - 一个 WorkerHandle 对应一个 Worker 子进程、一条 Pipe、一条物理通路。
+        - ready_event 由子进程 __init__ 完成后 set，父进程可据此等待"就绪"。
+    """
     def __init__(self, worker_id: int, transfer_conn: Connection, process: mp.Process, ready_event: Any):
+        """仅由 TransferWorkerBase.create_worker 在父进程侧构造。
+
+        Args:
+            worker_id: 子进程编号
+            transfer_conn: Pipe 的**发端**（子进程握收端）
+            process: 已 start 的 daemon 子进程
+            ready_event: 子进程初始化完成事件
+        """
         self.worker_id = worker_id
         self.transfer_conn = transfer_conn
         self.process = process
         self.ready_event = ready_event
 
     def submit_transfer(self, op: Union[TransferOp, LayerwiseTransferOp]) -> None:
+        """把一个 TransferOp 投递给 worker 子进程（非阻塞）。
+
+        控制面产出的 TransferOp 会被包装成 WorkerTransferOp（可 pickle 的
+        精简结构，block id 尽量走共享 op_buffer 而不是随消息拷贝）。
+        若开启了 transfer trace，这里顺带记录 submit 时刻并增加 in-flight 计数。
+        """
         if isinstance(op, LayerwiseTransferOp):
             worker_op = WorkerLayerwiseTransferOp(op)
         else:
@@ -840,6 +1062,16 @@ class WorkerHandle:
     def control(
         self, command: str, payload: Any = None, timeout: float = 120.0
     ) -> Any:
+        """同步下发一条控制指令并等待 worker 应答。
+
+        与 submit_transfer 不同，这里**阻塞**：发完就 poll 等 reply，
+        靠 request_id 对账防止串台。主要用于 GPU 热重映射
+        （suspend_gpu / resume_gpu）。
+
+        Raises:
+            TimeoutError: worker 在 timeout 内没应答（默认 120s）
+            RuntimeError: 回来的 request_id 对不上，或 worker 侧抛了异常
+        """
         request_id = f"{self.worker_id}:{time.monotonic_ns()}"
         self.transfer_conn.send({
             "type": "control",
@@ -861,6 +1093,14 @@ class WorkerHandle:
         return reply.get("result")
 
     def shutdown(self) -> None:
+        """优雅停止 worker 子进程：None 哨兵 -> join -> terminate -> kill 三级降级。
+
+        为什么必须先发 None 而不是直接 kill：worker 持有 pinned 内存和 VMM 映射，
+        被 SIGKILL 掉的话 cudaHostUnregister / release_vmm 都来不及执行，
+        物理页会被永久钉住（表现为宿主机内存缓慢泄漏）。所以先给
+        worker_shutdown_timeout_s 秒让它自己走完 _worker_process 的 finally，
+        超时才 terminate，再超时才 kill。
+        """
         try:
             self.transfer_conn.send(None)
         except (BrokenPipeError, OSError, EOFError):
@@ -885,6 +1125,11 @@ class WorkerHandle:
             pass
 
     def __del__(self) -> None:
+        """兜底：句柄被 GC 时若子进程还活着，走一次优雅 shutdown。
+
+        注意这里吞掉所有异常——解释器退出阶段调用 __del__ 时
+        很多模块已经变成 None，抛异常只会打出无意义的噪音。
+        """
         try:
             if getattr(self, "process", None) is not None and self.process.is_alive():
                 self.shutdown()
@@ -892,6 +1137,41 @@ class WorkerHandle:
             pass
 
 class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non-tp and non-dp case
+    """GPU <-> CPU 通路（H2D / D2H），单卡、非 TP 场景的主线 worker。
+
+    在链路中的职责：
+        TransferEngine 里所有 GPU<->CPU 的 TransferOp 都落到这里。
+        H2D = 命中前缀的 KV 从 CPU 内存拉回显存；D2H = 把新算出来的 KV 卸载到 CPU。
+
+    传输机制（两条，由 use_ce_transfer_h2d / _d2h 决定）：
+        1) Copy Engine（CE）路径：走 GPU 上独立的 DMA 拷贝引擎（cudaMemcpyAsync
+           一族），不占用 SM，与正在跑的 forward kernel 真正并行。
+           c_ext 侧还会按 ce_segment_threshold 把大块切段、按 ce_path_opt
+           选路（一维 memcpy / 二维 memcpy2D / 分段 gather），
+           ce_force_path=-1 表示交给 C++ 自动选。
+        2) Kernel 路径：起一个自定义 kernel 逐 chunk 搬，transfer_num_cta
+           控制起多少个 CTA。CE 不可用时（老驱动/老卡）退回这条。
+        两条路径都通过同一个 c_ext.transfer_kv_blocks 入口，只是参数不同。
+
+    线程模型：
+        单进程单线程（本 worker 的子进程）。既没有线程池也没有后台 IO 线程；
+        CUDA 工作全部投递到 self.transfer_stream 这条**非默认流**上，
+        避免和推理主进程的默认流互相排队。c_ext 以 sync=True 调用，
+        所以 launch_transfer 返回即代表数据已经在目标侧可见。
+
+    调用 c_ext 的方式：
+        _transfer_impl 把"两侧 stride + 指针数组 + block id 列表"一次性传给
+        transfer_kv_blocks(...)，由 C++ 完成所有 block、所有 layer 的搬运；
+        Python 侧不做逐 block 循环（那会是成千上万次 pybind 调用）。
+
+    完成回调：
+        launch_transfer 返回 True -> 基类 run() 把 (op_id, True, metrics)
+        put 进 finished_ops_queue，TransferEngine._scheduler_loop 消费后
+        推进 TransferOpGraph，最终通知 KVTaskEngine。
+
+    注意：多卡 TP 场景请用 tpGPUCPUTransferWorker（本类只支持单卡，
+    类名后面的注释已经写明了 non-tp and non-dp）。
+    """
     def __init__(self,
                  worker_id: int,
                  transfer_conn: Connection,
@@ -911,6 +1191,24 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
                  layer_groups: Optional[List[LayerGroupSpec]] = None,
                  gpu_blocks_per_group: Optional[List[List[TensorSharedHandle]]] = None,
                  gpu_layouts_per_group: Optional[List[KVCacheLayout]] = None) -> None:
+        """解析 GPU/CPU 两侧的布局，并把两侧内存都"准备好"。
+
+        顺序不能乱（每一步都依赖上一步）：
+            1. super().__init__          建立 Pipe / 完成队列 / 清理登记
+            2. ensure_cuda_device        绑定 GPU，**必须早于一切 CUDA 调用**
+            3. _pin_op_buffer            pin 共享 block id 缓冲
+            4. materialize + register    CPU KV 池锁页（hugepage 句柄 -> tensor）
+            5. import_tensor_handles     通过 CUDA IPC 把父进程的 GPU KV 映射进来
+            6. 算 stride                 GPU 侧优先从实际 tensor 反推（兼容不同后端布局）
+            7. torch.cuda.Stream()       建专用传输流
+
+        Args:
+            gpu_blocks: 父进程的 GPU KV tensor 的 IPC 句柄列表（每层一个，或 K/V 各一个）
+            cpu_blocks: CPU KV 池（可能是 HugePageTensorHandle，需 materialize）
+            use_ce_transfer_h2d/_d2h: 分别控制两个方向是否走 Copy Engine
+            transfer_num_cta_h2d/_d2h: kernel 路径下起多少个 CTA
+            layer_groups / *_per_group: 异构 KV（如主 KV + DSA indexer）多分组布局
+        """
         # initialize worker in a new process
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
 
@@ -1018,7 +1316,12 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         cpu_kv_layout: KVCacheLayout,
         layer_groups: List[LayerGroupSpec],
     ) -> None:
-        """Initialize per-group transfer parameters for models with mixed KV shapes."""
+        """Initialize per-group transfer parameters for models with mixed KV shapes.
+
+        中文要点：异构 KV（主 KV bf16 + DSA indexer uint8）在一个 CPU block 内
+        按 group 依次排布。这里为每个 group 算出它自己的 GPU/CPU stride 和
+        cpu_offset_bytes，之后 _transfer_impl 对每个 group 各发一次 c_ext 调用。
+        """
         kv_dim = self.kv_dim
         tpb = cpu_kv_layout.tokens_per_block
         cpu_layout_type = cpu_kv_layout.type
@@ -1125,6 +1428,12 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         )
 
     def _control_suspend_gpu(self, payload: Any) -> int:
+        """控制面：释放 GPU 侧的 VMM 映射（GPU 热重映射的第一步）。
+
+        把指针数组清零 + 释放 CUDA VMM 映射，让别的使用方可以接管这块物理显存。
+        之后必须由 _control_resume_gpu 按相同数量恢复，否则 worker 就废了。
+        多分组布局不支持（每个 group 有自己的指针数组，无法一次性摘干净）。
+        """
         if self.group_transfer_params is not None:
             raise NotImplementedError(
                 "GPU hot remap does not support multi-group KV layouts"
@@ -1147,6 +1456,11 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
     def _control_resume_gpu(
         self, gpu_blocks: List[TensorSharedHandle]
     ) -> int:
+        """控制面：重新导入 GPU tensor 并恢复指针数组（suspend 的逆操作）。
+
+        数量必须和 suspend 前一致（_gpu_block_count），否则 stride 与
+        实际 tensor 数对不上，后续传输会静默错位。
+        """
         if self.gpu_blocks:
             raise RuntimeError("GPU blocks are already registered")
         if len(gpu_blocks) != self._gpu_block_count:
@@ -1166,6 +1480,16 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         transfer_type: TransferType,
         **kwargs: Any,
     ) -> None:
+        """把 block id 列表翻译成一次 transfer_kv_blocks 调用。
+
+        方向映射：H2D 时 src=CPU/dst=GPU，D2H 时反过来；c_ext 只认
+        "gpu_block_id_list / cpu_block_id_list"，不认方向枚举。
+
+        两条分支：
+            - 多分组：每个 group 一次调用，CPU 侧按 cpu_offset_bytes 切片
+              （多分组下 cpu_tensor 是 uint8 字节池，切片即字节寻址）；
+            - 统一布局：一次调用搬完整个模型的所有 layer。
+        """
         assert src_block_ids.dtype == torch.int64
         assert dst_block_ids.dtype == torch.int64
         assert len(src_block_ids) == len(dst_block_ids)
@@ -1258,6 +1582,15 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
             )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
+        """执行一个 H2D/D2H op（由基类 run() 调用）。
+
+        关键：整个传输跑在 self.transfer_stream 上而不是默认流，
+        这样不会和推理主进程的 compute stream 互相排队。
+
+        统一布局走 self._compressor.run(...)（压缩器内部会回调本对象的
+        _transfer_impl，NullCompressionStrategy 则直接透传）；
+        多分组不支持压缩，直接内联调用并自己算传输量。
+        """
         nvtx_range = nvtx.start_range(
             message=f"GPUCPUWorker.launch_transfer[{transfer_op.transfer_op_id}]",
             color="purple")
@@ -1296,6 +1629,29 @@ class GPUCPUTransferWorker(TransferWorkerBase):  # this worker only supports non
         return True
 
 class tpGPUCPUTransferWorker(TransferWorkerBase):
+    """GPU <-> CPU 通路（H2D / D2H）的 **TP 多卡** 版本。
+
+    与非 TP 版本（GPUCPUTransferWorker）的差异 —— 这是理解本类的关键：
+        1. 入参是"二维"的：gpu_blocks[card][layer]，每张卡一套 GPU KV tensor，
+           gpu_kv_layouts 也是每张卡一份（各卡 stride 可能不同）。
+        2. CPU 侧多了一个 **tp 维度**：TP 下每张卡只持有 1/tp_size 的 KV head，
+           CPU 池里这些分片必须按 tp 维度拼接。约定是"tp 维永远紧跟 block 维"，
+           因此 cpu_tp_stride = cpu_block_stride // tp_group_size；
+           BLOCKFIRST 且 num_kv_heads > 1 时还要先 div_head(tp_group_size)。
+        3. 不用 torch 的 stream，而是用 C++ 的 ``TPTransferThreadGroup``：
+           它为**每张卡起一个专属线程**、各自 set_device 后并发下发拷贝。
+           这是必需的——一次 cudaMemcpyAsync 只能作用于**当前设备**，
+           想在单进程里同时驱动 8 张卡，就必须一卡一线程各自持上下文。
+           因此本类没有 self.transfer_stream。
+        4. 指针在 Python 侧解析好再传进 C++：spawn 出来的子进程里，
+           pybind11 对跨进程 tensor 调 .data_ptr() 会报
+           "Tensor that doesn't have storage"，所以在 Python 里取裸指针传进去。
+
+    线程模型：
+        本 worker 主线程（收任务、解析） + TPTransferThreadGroup 的 N 个
+        per-GPU 传输线程（N = num_gpus）。调用 tp_group_transfer 时
+        主线程下发、阻塞等待所有卡完成后返回（同步语义）。
+    """
     def __init__(self,
                  worker_id: int,
                  transfer_conn: Connection,
@@ -1315,6 +1671,19 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                  layer_groups: Optional[List[LayerGroupSpec]] = None,
                  gpu_blocks_per_group: Optional[List[List[List[TensorSharedHandle]]]] = None,
                  gpu_layouts_per_group: Optional[List[List[KVCacheLayout]]] = None):
+        """解析 N 张卡的布局，并建好 TPTransferThreadGroup。
+
+        与 GPUCPUTransferWorker.__init__ 的三点差异：
+            - ensure_cuda_device 用 gpu_blocks[0][0].device（主卡），
+              后续每卡由 import_tensor_handles 各自 set_device；
+            - stride 是"每卡一组"的列表而不是单个标量；
+            - 最后构造 TPTransferThreadGroup（每卡一线程）而不是 torch Stream。
+
+        Args:
+            tp_group_size: 本节点上有效的 TP 规模
+            gpu_kv_layouts: 与 gpu_blocks 一一对应，每卡一份 layout
+            kv_shared_across_ranks_mode: 各 rank 的 KV 是否相同（相同则 D2H 只需搬一份）
+        """
 
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         assert len(gpu_blocks) == tp_group_size
@@ -1451,6 +1820,10 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         Per-group strides use g.dtype.itemsize so groups with different element
         sizes (e.g. bf16 main + uint8 indexer) interleave correctly within a
         block.
+
+        中文要点：与非 TP 的 _init_multi_group 思路一致，但每个 group 都要
+        建一个**独立的** TPTransferThreadGroup（因为每组的 tensor 数/stride 不同），
+        并把该组在 CPU block 内的字节偏移通过 cpu_blocks_ptr 传进去。
         """
         kv_dim = self.kv_dim
         tpb = cpu_kv_layout.tokens_per_block
@@ -1582,6 +1955,12 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
 
 
     def _control_suspend_gpu(self, payload: Any) -> int:
+        """控制面：释放所有卡的 VMM 映射。
+
+        与非 TP 版的差异：指针不放在 Python 数组里，而是存在 C++ 的
+        TPTransferThreadGroup 中，所以要先 update_gpu_block_ptrs(全 0)
+        把 C++ 侧指针打空，再释放 Python 侧的 tensor。
+        """
         if self.tp_group_transfer_groups is not None:
             raise NotImplementedError(
                 "GPU hot remap does not support multi-group KV layouts"
@@ -1607,6 +1986,7 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
     def _control_resume_gpu(
         self, gpu_blocks: List[List[TensorSharedHandle]]
     ) -> int:
+        """控制面：重新导入各卡 tensor 并把新的裸指针推回 C++ 线程组。"""
         if self.gpu_blocks:
             raise RuntimeError("GPU blocks are already registered")
         counts = [len(handles) for handles in gpu_blocks]
@@ -1634,6 +2014,12 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
                        transfer_type: TransferType,
                        **kwargs: Any,
                        )->None:
+        """把 block id 列表翻译成 TPTransferThreadGroup.tp_group_transfer 调用。
+
+        CPU 侧四个 stride 中比非 TP 版多一个 cpu_tp_stride：
+        C++ 靠它把第 r 张卡的 head 分片写到 CPU block 内正确的位置。
+        GPU 侧的 stride/chunk_size 已经在 __init__ 里交给线程组了，这里不再传。
+        """
         assert src_block_ids.dtype == torch.int64
         assert dst_block_ids.dtype == torch.int64
         assert len(src_block_ids) == len(dst_block_ids)
@@ -1699,6 +2085,11 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
 
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
+        """执行一个 TP 场景的 H2D/D2H op。
+
+        注意这里**不**绑 torch stream：并发是由 C++ 侧 per-GPU 线程组完成的，
+        Python 侧只负责解析和计时。
+        """
         src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
         if self.tp_group_transfer_groups is not None:
             # Multi-group (heterogeneous KV) path — compression not supported here.
@@ -1728,6 +2119,39 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
         return True
 
 class CPUSSDDiskTransferWorker(TransferWorkerBase):
+    """CPU <-> 本地 SSD 通路（H2DISK / DISK2H），基于 **io_uring**。
+
+    在链路中的职责：
+        三级存储的第二级。D2H 把 KV 落到 CPU 后，由本 worker 再异步刷到
+        本地 NVMe；命中时反过来 DISK2H 读回 CPU（之后再由 GPUCPU worker 拉上卡）。
+
+    传输机制 —— io_uring：
+        __init__ 里建 ``c_ext.SSDIOCTX(ssd_files, ..., iouring_entries,
+        iouring_flags)``：这是 C++ 侧持有的一组 io_uring ring（每块盘一个），
+        _entries 是 SQE 队列深度，_flags 透传给 io_uring_setup。
+        每次 _transfer_impl 把"每个 block × 每个 layer × 每个 kv"的
+        pread/pwrite 请求**批量**提交进 ring，然后内核侧由 C++ 等待 CQE
+        全部完成才返回（所以 Python 侧依然是同步语义）。
+        相比 libaio / 普通 pread：省掉每请求一次系统调用，且支持内核态轮询。
+
+    向量化 I/O：
+        transfer_kv_blocks_ssd 的倒数第三个参数 32 是 **并发线程数/队列深度**，
+        C++ 会把 block 列表切片后并发提交；配合 ssd_io_opt（GLOBAL_CONFIG）
+        可以启用更大粒度 / 合并相邻请求等优化。
+
+    文件映射：
+        多个 SSD 文件 round-robin 存放 block（round_robin=1 表示一个 block
+        粒度轮转），num_blocks_per_file 决定 block_id -> (file, offset) 的换算。
+        SSD 侧的 stride 用 ssd_kv_layout.div_block(num_files) 得到"每文件"布局。
+
+    关于 hugepage：
+        本通路**不**使用 hugepage 临时缓冲——CPU KV 池本身就是
+        HugePageTensorHandle（见 materialize_worker_tensor），读写直接落在
+        大页上，减少 TLB miss。真正用到 hugepage **临时**缓冲的是
+        PEER2CPUTransferWorker（见 allocate_host_buffer 相关注释）。
+
+    线程模型：单进程单线程，无 CUDA 参与（不需要绑 GPU、不建 stream）。
+    """
     def __init__(self,
                  worker_id: int,
                  transfer_conn: Connection,
@@ -1742,6 +2166,17 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
                  cache_config: CacheConfig,
                  compressor: Optional[CompressionStrategy] = None,
                  layer_groups: Optional[List[LayerGroupSpec]] = None):
+        """解析 CPU/SSD 两侧布局并建好 io_uring 上下文。
+
+        注意这里**不**调 ensure_cuda_device：本通路没有任何 CUDA 参与，
+        但 op_buffer 仍然要 pin（c_ext 会 DMA 读 block id）。
+
+        Args:
+            ssd_files: {ssd_device_id: [文件路径...]}，多盘多文件轮转
+            num_blocks_per_file: 每个文件放多少个 block（决定文件内偏移换算）
+            cpu_kv_layout / ssd_kv_layout: 两侧必须是同一种 layout type
+                （BLOCKFIRST / LAYERFIRST 不能混），否则直接 ValueError
+        """
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         self._pin_op_buffer()
         cpu_blocks = materialize_worker_tensor(cpu_blocks)
@@ -1801,6 +2236,13 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
         CPU and SSD share an identical per-block byte layout (BLOCKFIRST),
         so multi-group SSD transfers move whole blocks as opaque blobs —
         no per-group / per-tp_rank slicing needed at the IO layer.
+
+        中文要点：多分组下 CPU 与 SSD 的每 block 字节布局完全一致，
+        所以整块可以当一个"不透明 blob"搬 —— 把 num_layers 说成 1、
+        chunk_size = block_stride，C++ 就会对每个 block 只发一次
+        block_stride 字节的 pread/pwrite。这样也顺带避开了高压缩比 group
+        （如 DSv4 indexer，compress_ratio=128）产生 sub-4KiB 小 IO 的坑：
+        NVMe 上小于 4K 的读写会触发读改写放大，吞吐掉一个数量级。
         """
         # Multi-group BLOCKFIRST: get_block_stride() returns bytes_per_block
         # directly (already accounts for tp_size and per-group dtype sizes).
@@ -1818,6 +2260,11 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
         transfer_type: TransferType,
         **kwargs: Any,
     ) -> None:
+        """把 block id 列表翻译成一次 transfer_kv_blocks_ssd 调用。
+
+        参数里的 32 是并发度（C++ 侧把请求切片并发提交给 io_ring）；
+        is_read 决定 pread(DISK2H) 还是 pwrite(H2DISK)。
+        """
         assert src_block_ids.dtype == torch.int64
         assert dst_block_ids.dtype == torch.int64
         assert len(src_block_ids) == len(dst_block_ids)
@@ -1886,6 +2333,11 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
             )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
+        """执行一个 H2DISK / DISK2H op。
+
+        统一布局走压缩器（SSD 上可以存压缩后的 KV，省带宽和容量）；
+        多分组不支持压缩，按 block_stride × block 数直接算传输量。
+        """
         src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
         if self.has_multi_group:
             # Multi-group (heterogeneous KV) path — compression not supported here.
@@ -1912,6 +2364,27 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
         return True
 
 class CPURemoteTransferWorker(TransferWorkerBase):
+    """CPU <-> 远端共享存储（PCFS）通路：H2REMOTE / REMOTE2H【旁支，默认不生效】。
+
+    启用条件：**需要以 FLEXKV_ENABLE_CFS=1 重新编译 c_ext**。
+    未开启时 ``from flexkv.c_ext import transfer_kv_blocks_remote`` 会
+    ImportError（本文件顶部已 try/except 兜成 None），
+    __init__ 第一行就会抛 RuntimeError —— 默认构建下这条通路完全不参与运行。
+
+    在链路中的职责：三级存储的第三级，跨节点共享的 KV 池，
+    让别的机器算过的前缀不必重算。
+
+    传输机制：不走 io_uring，而是走 PCFS（CFS 客户端）的用户态 SDK：
+        - __init__ 里 c_ext.Pcfs(...) 建客户端，把每个远端文件
+          lookup_or_create 成 nodeid，并 set 成全局实例；
+        - _transfer_impl 调 transfer_kv_blocks_remote，由 C++ 侧
+          做多线程远端读写（末尾的 32 是并发线程数）。
+        - enable_pcfs_sharing 且是读时，改走 shared_transfer_kv_blocks_remote_read：
+          按 src_block_node_ids 把 block 按"来自哪个远端文件"分组，
+          一次批量读多个文件。
+
+    线程模型：与 SSD worker 一样单进程单线程、无 CUDA。
+    """
     def __init__(self,
                  worker_id: int,
                  transfer_conn: Connection,
@@ -1924,6 +2397,14 @@ class CPURemoteTransferWorker(TransferWorkerBase):
                  dtype: torch.dtype,
                  remote_config_custom: Dict[str, Any],
                  enable_pcfs_sharing: bool = False):
+        """建 PCFS 客户端并完成远端文件的 lookup/create。
+
+        Args:
+            remote_file: 远端文件列表（block 在其间 round-robin 分布）
+            remote_config_custom: 必须含 pcfs_fsid / pcfs_port / pcfs_ip /
+                pcfs_parent_nodeid 四项，缺一即 RuntimeError
+            enable_pcfs_sharing: 读时是否走"多文件共享批量读"路径
+        """
         if transfer_kv_blocks_remote is None:
             raise RuntimeError("transfer_kv_blocks_remote not available, please build with FLEXKV_ENABLE_CFS=1")
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
@@ -2026,6 +2507,12 @@ class CPURemoteTransferWorker(TransferWorkerBase):
         transfer_type: TransferType,
         **kwargs: Any
     ) -> None:
+        """把 block id 列表翻译成远端读写调用。
+
+        注意：本方法没有返回值（CPURemoteTransferWorker.launch_transfer
+        末尾也确实没有 return 语句），因此基类 run() 拿到的是 None，
+        会按"失败"分支 put (op_id, False, None)。记录既有行为以便排查。
+        """
         assert src_block_ids.dtype == torch.int64
         assert dst_block_ids.dtype == torch.int64
         assert len(src_block_ids) == len(dst_block_ids)
@@ -2125,6 +2612,11 @@ class CPURemoteTransferWorker(TransferWorkerBase):
             )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
+        """执行一个 H2REMOTE / REMOTE2H op，并打性能日志。
+
+        本通路不走压缩器（压缩由上层/远端侧负责），直接调 _transfer_impl。
+        注意：见 _transfer_impl 的说明，本方法当前没有 return 值。
+        """
         src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
 
         start_time = time.time()
@@ -2145,6 +2637,29 @@ class CPURemoteTransferWorker(TransferWorkerBase):
         )
 
 class GDSTransferWorker(TransferWorkerBase):
+    """GPU <-> 本地 SSD **直通**通路（D2DISK / DISK2D），基于 GPUDirect Storage【旁支，默认不生效】。
+
+    启用条件：**需要以 FLEXKV_ENABLE_GDS=1 重新编译 c_ext**。
+    未开启时文件顶部的 ``from flexkv.c_ext import transfer_kv_blocks_gds``
+    会 ImportError，被 fallback 成 None（连同 TPGDSTransferThreadGroup），
+    本类一旦被实例化就会在调用 transfer_kv_blocks_gds 时炸掉。
+    默认构建不参与运行；CPU 侧仍走 CPUSSDDiskTransferWorker。
+
+    与 CPUSSDDiskTransferWorker 的本质差异：
+        GPUDirect Storage 让 NVMe 控制器通过 **DMA 直接读写显存**，
+        数据不经过 CPU 内存、不做 bounce buffer，
+        省掉 GPU->CPU->磁盘路径上的一次完整拷贝和一次 CPU 侧拷贝。
+        代价是依赖 nvidia-fs 内核模块和兼容的 NVMe 驱动/文件系统。
+
+    传输机制：
+        __init__ 里建 c_ext.GDSManager(ssd_files, ...)，由它持有 GDS 的
+        cuFile 句柄与注册过的显存缓冲区；is_ready() 为假即抛错。
+        _transfer_impl 调 transfer_kv_blocks_gds，参数里除了两侧 stride，
+        还有 ssd_copy_offset（多分组时该组在 SSD block 内的字节偏移）。
+
+    线程模型：单进程单线程 + 一条专属 transfer_stream；
+    GDS 的 DMA 由驱动异步完成，c_ext 返回即完成。
+    """
     def __init__(
         self,
         worker_id: int,
@@ -2164,6 +2679,14 @@ class GDSTransferWorker(TransferWorkerBase):
     ) -> None:
         """
         Initialize GDS Transfer Worker
+
+        中文要点：先绑 GPU、再 pin op_buffer、再导入 GPU tensor（顺序同
+        GPUCPUTransferWorker），然后建 GDSManager 并校验 is_ready()，
+        最后建专用 stream。GPU 侧的 stride 同样优先从实际 tensor 反推。
+
+        Args:
+            ssd_files: {ssd_device_id: [路径...]}
+            gpu_blocks: GPU KV tensor 的 IPC 句柄（GDS 需要注册这些显存）
         """
         # Initialize base class first
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
@@ -2254,6 +2777,10 @@ class GDSTransferWorker(TransferWorkerBase):
         SSD buffer is byte-flat (uint8) in multi-group mode; per-group strides
         use g.dtype.itemsize so groups with different element sizes (e.g.
         bf16 main + uint8 indexer) interleave correctly within a block.
+
+        中文要点：每个 group 算出自己的 GPU/SSD stride 以及 ssd_copy_offset
+        （该组在 SSD block 内的起始字节偏移），_transfer_impl 里对每个 group
+        各发一次 transfer_kv_blocks_gds。
         """
         kv_dim = self.kv_dim
         tpb = ssd_kv_layout.tokens_per_block
@@ -2333,7 +2860,12 @@ class GDSTransferWorker(TransferWorkerBase):
         transfer_type: TransferType,
         **kwargs: Any,
     ) -> None:
-        """Implement actual transfer between GPU and SSD"""
+        """Implement actual transfer between GPU and SSD
+
+        中文要点：GPU 与 SSD 的 block id 按方向互换后，交给
+        transfer_kv_blocks_gds；失败时包一层 RuntimeError 抛出，
+        由基类 run() 捕获并上报 failed（而不是让异常把 worker 循环带崩）。
+        """
         assert src_block_ids.dtype == torch.int64
         assert dst_block_ids.dtype == torch.int64
         assert len(src_block_ids) == len(dst_block_ids)
@@ -2414,7 +2946,11 @@ class GDSTransferWorker(TransferWorkerBase):
             raise RuntimeError(f"Failed to transfer KV blocks: {e}") from e
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
-        """Launch a GDS transfer operation"""
+        """Launch a GDS transfer operation
+
+        中文要点：整段跑在 transfer_stream 上；本通路不支持压缩，
+        直接调 _transfer_impl 并按 group 累加传输量打日志。
+        """
         src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
 
         with torch.cuda.stream(self.transfer_stream):
@@ -2443,6 +2979,19 @@ class GDSTransferWorker(TransferWorkerBase):
 
 
 class tpGDSTransferWorker(TransferWorkerBase):
+    """GPU <-> 本地 SSD 直通通路的 **TP 多卡** 版本（D2DISK / DISK2D）【旁支，默认不生效】。
+
+    启用条件：**需要以 FLEXKV_ENABLE_GDS=1 重新编译 c_ext**（同 GDSTransferWorker）。
+    未开启时 TPGDSTransferThreadGroup 为 None，本类无法工作，默认构建不生效。
+
+    与 GDSTransferWorker 的差异（同 TP 版 GPUCPU worker 的思路）：
+        - 入参 gpu_blocks[card][layer]、gpu_kv_layouts[card] 都是"每卡一份"；
+        - 用 C++ 的 TPGDSTransferThreadGroup：**每卡一个线程**各自持 CUDA
+          上下文与 GDS 句柄，并发下发，因为一次 GDS 传输只能作用于当前设备；
+        - SSD 侧多一个 ssd_tp_stride：TP 下每卡只存 1/tp_size 的 head，
+          靠它在 block 内定位本卡分片；
+        - 没有 transfer_stream，并发完全由 C++ 线程组负责。
+    """
     def __init__(
         self,
         worker_id: int,
@@ -2478,6 +3027,10 @@ class tpGDSTransferWorker(TransferWorkerBase):
                 ``tp_size_per_node × cp_size_per_node``).
             layer_groups: Optional per-group KV layouts for heterogeneous models
                 (including DSA/NSA indexer-as-group).
+
+        中文要点：与 tpGPUCPUTransferWorker.__init__ 同构 ——
+        绑主卡 -> pin -> 逐卡 import -> 算每卡 stride -> 建
+        TPGDSTransferThreadGroup（每卡一线程）。差别在最后不需要 torch Stream。
         """
         # Initialize base class first
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
@@ -2585,6 +3138,10 @@ class tpGDSTransferWorker(TransferWorkerBase):
         SSD buffer is byte-flat (uint8) in multi-group mode; per-group strides
         use g.dtype.itemsize so groups with different element sizes (e.g.
         bf16 main + uint8 indexer) interleave correctly within a block.
+
+        中文要点：每个 group 建一个独立的 TPGDSTransferThreadGroup
+        （因为各组的 tensor 数与 stride 不同），并记录该组在 SSD block 内的
+        ssd_copy_offset；_transfer_impl 里对每个 group 各调一次 tp_group_transfer。
         """
         kv_dim = self.kv_dim
         tpb = ssd_kv_layout.tokens_per_block
@@ -2707,6 +3264,11 @@ class tpGDSTransferWorker(TransferWorkerBase):
                        transfer_type: TransferType,
                        **kwargs: Any,
                        ) -> None:
+        """把 block id 列表翻译成 TPGDSTransferThreadGroup.tp_group_transfer 调用。
+
+        多分组时每组各调一次；统一布局时一次搬完所有 layer。
+        SSD 侧除了 layer/kv/block stride 还多传一个 ssd_tp_stride。
+        """
         assert src_block_ids.dtype == torch.int64
         assert dst_block_ids.dtype == torch.int64
         assert len(src_block_ids) == len(dst_block_ids)
@@ -2765,7 +3327,11 @@ class tpGDSTransferWorker(TransferWorkerBase):
             )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
-        """Launch a TP GDS transfer operation"""
+        """Launch a TP GDS transfer operation
+
+        中文要点：不绑 torch stream（并发由 C++ 每卡线程完成）；
+        不支持压缩，直接调 _transfer_impl 后按 group 累加传输量打日志。
+        """
         src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
 
         start_time = time.time()
@@ -2799,6 +3365,21 @@ class NixlTransferWorker(TransferWorkerBase):
     Both ``gpu_kv_layout`` and ``cpu_kv_layout`` are required so GPU, CPU, and SSD (per-file)
     byte strides are always defined; only the tensors needed for the chosen backend must be
     provided (``gpu_blocks`` for GDS_MT, ``cpu_blocks`` for POSIX/3FS).
+
+    中文补充 —— 定位与启用条件【旁支，默认不生效】：
+        本类把 SSD 这一级的 I/O 外包给 **NIXL**（NVIDIA 的跨存储/网络
+        传输库），按 nixl_backend 分成两条完全不同的通路：
+          - GDS_MT：GPU <-> 文件，transfer_type 用 DISK2D / D2DISK
+          - POSIX / 3FS：CPU <-> 文件，transfer_type 用 DISK2H / H2DISK
+        启用条件：需要 NIXL 后端可用 + 配置里指定 nixl_backend。
+        默认构建（未启用 NIXL）这条通路不参与运行。
+
+    与其它 worker 的最大差异：
+        其它 worker 都是"一次 pybind 调用把所有 block 搬完"；
+        本类在 Python 侧**逐 block × 逐 layer × 逐 kv** 展开成
+        (地址, 长度, 文件路径, 文件内偏移) 的平铺列表，再一次性交给
+        NixlAgentSession.xfer_vram_file / xfer_dram_file。
+        即"Python 算描述、NIXL 批量执行"。
     """
 
     def __init__(
@@ -2819,6 +3400,16 @@ class NixlTransferWorker(TransferWorkerBase):
         cpu_blocks: Optional[torch.Tensor] = None,
         gpu_device_id: int = 0,
     ) -> None:
+        """校验后端合法性、算三侧 stride、建 NixlAgentSession 并注册内存/文件。
+
+        GDS_MT 分支：绑 GPU -> import GPU tensor -> prepare_all_ssd_files
+            -> prepare_vram_gpu（把显存注册给 NIXL）-> 建 transfer_stream。
+        POSIX/3FS 分支：把 CPU 池 pin 住 -> prepare_dram_cpu -> 不需要 CUDA。
+
+        Note:
+            _pin_op_buffer 必须排在 ensure_cuda_device 之后（见基类说明），
+            所以这里先判断后端再绑卡。
+        """
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
 
         be = normalize_nixl_file_plugin_name(str(nixl_backend).upper())
@@ -2946,6 +3537,17 @@ class NixlTransferWorker(TransferWorkerBase):
         layer_granularity: int,
         **kwargs: Any,
     ) -> None:
+        """把 block id 列表展开成 NIXL 的批量传输描述并执行。
+
+        支持按层切片（layer_id / layer_granularity），这是本类区别于其它
+        worker 的地方：只搬某几层而不是整块，便于做分层流水。
+
+        展开方式：对每个 block、每个 layer、每个 kv，分别算出
+        - GPU 侧：gpu_chunk_u8_view 切出该 chunk 的 uint8 视图（GDS_MT）
+          或 CPU 侧 kv_chunk_byte_offset_in_block 算出地址（POSIX/3FS）
+        - 文件侧：ssd_chunk_byte_offset_in_file 算出文件内偏移
+        最后一次性提交给 NIXL；失败抛出，由基类 run() 捕获上报。
+        """
         assert src_block_ids.dtype == torch.int64
         assert dst_block_ids.dtype == torch.int64
         assert len(src_block_ids) == len(dst_block_ids)
@@ -3081,6 +3683,11 @@ class NixlTransferWorker(TransferWorkerBase):
                 raise RuntimeError(f"NIXL {self.nixl_backend} CPU↔file transfer failed")
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
+        """执行一个 NIXL 文件传输 op，可只搬 [layer_id, +layer_granularity) 这几层。
+
+        GDS_MT 需要在 transfer_stream 上跑（NIXL 的 VRAM 传输走 CUDA）；
+        POSIX/3FS 是纯 CPU 路径，用 nullcontext 跳过流绑定。
+        """
         lid = transfer_op.layer_id
         lg = transfer_op.layer_granularity
         if lid == -1:
@@ -3117,6 +3724,59 @@ class NixlTransferWorker(TransferWorkerBase):
 
 
 class PEER2CPUTransferWorker(TransferWorkerBase):
+    """跨机 P2P 通路：**对端的 CPU / SSD -> 本地 CPU**（PEERH2H / PEERSSD2H）【旁支，默认不生效】。
+
+    启用条件：**需要 cache_config.enable_kv_sharing=1 + Mooncake + Redis**
+    （enable_p2p_ssd 还要额外开 SSD 相关配置）。未启用时 __init__ 里
+    Mooncake/Redis 那一段整体跳过，本 worker 退化成什么都不做。
+
+    ┌── 一句话总览 ─────────────────────────────────────────────────────────┐
+    │ 本类是全文件最复杂的 worker，因为它同时握着 **控制面** 和 **数据面**：│
+    │   控制面 = ZMQ（交换元数据 / 通知），数据面 = RDMA（真正搬字节）。    │
+    └──────────────────────────────────────────────────────────────────────┘
+
+    控制面（ZMQ + Redis）：
+        - Redis：节点注册表。每个节点把自己的 mooncake engine 地址、
+          CPU/SSD 缓冲基址、ZMQ 监听地址写进 Redis（regist_node_meta），
+          带 TTL 心跳；取值前先 is_node_active() 校验，防止往已挂节点 RDMA。
+        - ZMQ：任务级信令。
+            SSDZMQServer（本地监听 local_zmq_port，回调 ssd_handle_loop）
+            SSDZMQClient（发往对端 local_zmq_port）
+          用来传 RemoteSSD2HMetaInfo（要哪些 block、写到我哪、完成后通知谁）
+          和 NotifyMsg（成功/失败回执）。
+
+    数据面（RDMA / Mooncake）：
+        - PEERH2H（对端 CPU -> 本地 CPU）：本端**主动**单向 RDMA read
+          （transfer_sync_read / batch_transfer_sync_read）。控制面只在
+          传输前用一次 Redis 取对端地址。
+        - PEERSSD2H（对端 SSD -> 本地 CPU）：数据在对端磁盘上、本端够不着，
+          所以改成"请对端代劳"——本端用 ZMQ 发一份 meta 给对端，
+          对端的 ssd_handle_loop 收到后自己 io_uring 读盘到它的 hugepage
+          临时缓冲，再**单向 RDMA write** 推到本端 CPU，最后 ZMQ 发回执。
+          即：一次读 = 两次 ZMQ + 一次 RDMA write。
+
+    为什么需要 hugepage 临时缓冲（tmp_cpu_buffer）：
+        对端帮你读盘时，数据得先落在一块"本站可被 RDMA 直接读"的内存里。
+        这块缓冲通过 allocate_host_buffer(use_hugepage=...) 分配：
+        hugepage 能显著降低大块 RDMA 的 TLB miss；分配后同样要
+        regist_buffer 注册给 Mooncake 才能被对端 RDMA 访问。
+        它只有 num_tmp_cpu_blocks 个 block 大，所以超过这个数量的请求
+        会被 ssd_handle_loop 直接拒绝（见其中的 TODO）。
+
+    完成回调路径：
+        launch_transfer -> op_parser 按"对端节点"切成多个 RDMATaskInfo
+        -> 逐个 _batch_transfer_impl -> 汇总成 bool 返回
+        -> 基类 run() put 进 finished_ops_queue。
+        注意 PEERSSD2H 的完成与否取决于对端 ZMQ 回执（wait_transfer_notify），
+        并且有 RDMA_TRANSFER_TIMEOUT_SECONDS 兜底，防止对端失联时永久阻塞。
+
+    本地行为 vs 远端行为的分工（本类方法可按此分组）：
+        本地（主动发起）：op_parser / _dist_cpu_op_parser / _dist_ssd_op_parser
+                          / _batch_transfer_impl / launch_transfer
+        远端（被动服务）：ssd_handle_loop / copy_ssd_data_to_dram
+                          / write_data_back_to_peer / meta_info_parser
+        公共：get_cpu_buffer_block_start_ptr / gen_task_id / Redis 三件套
+    """
     def __init__(self,
         worker_id: int,
         transfer_conn: Connection,
@@ -3132,6 +3792,23 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         num_blocks_per_file: int = 0,
         mooncake_config_path: str = None,
     ):
+        """初始化顺序（step1~step4，注释里也是这么标号的）：
+
+            step1：建 Redis 客户端，连上节点信息表并扫描活跃节点
+                   （必须先 connect，否则 is_node_active 永远为假）
+            step2：建 Mooncake 传输引擎（config 优先取参数 > cache_config >
+                   环境变量，因为 spawn 的子进程可能丢环境变量）
+            step3：把本地 CPU 池 regist_buffer 给 Mooncake
+                   （不注册对端就 RDMA 不到这块内存）
+            step3.5（enable_p2p_ssd 时）：分配 hugepage tmp 缓冲、
+                   起 ZMQ server/client、建 io_uring ioctx
+            step4：把本节点的元信息注册进 Redis
+                   —— 必须在 step3.5 之后，这样注册的 ssd_buffer_base_ptr
+                      才是 tmp_cpu_buffer 的真实地址
+
+        注意：本类**不** pin CPU 池给 CUDA（见 MooncakeStoreTransferWorker 的
+        说明），但 Mooncake 会自己做 RDMA 内存注册。
+        """
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         self._pin_op_buffer()
         cpu_blocks = materialize_worker_tensor(cpu_blocks)
@@ -3335,6 +4012,10 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         generate a unique task id for remote ssd to cpu transfer task
         Returns:
             int: task id
+
+        中文要点：task_id 用于把"我发的请求"和"对端回的回执"对上号
+        （wait_transfer_notify 按 (peer_engine_addr, task_id) 匹配），
+        所以它必须在本进程内单调递增且加锁保护。
         """
         with self.task_id_lock:
             old_value = self.remote_ssd_task_id_counter
@@ -3342,7 +4023,14 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             return old_value
 
     def shutdown(self):
-        """Best-effort cleanup; tolerant of partially-failed ``__init__``."""
+        """Best-effort cleanup; tolerant of partially-failed ``__init__``.
+
+        中文要点：本类持有的外部资源比其它 worker 多得多，必须逐个拆掉，
+        且每个都可能不存在（__init__ 中途失败时），所以全程 getattr + try：
+            ZMQ server/client -> Mooncake 注销 CPU 池 -> 注销 tmp 缓冲
+            -> 释放 hugepage handle -> Redis 摘掉本节点元信息
+        最后**必须**调 super().shutdown() 解绑 op_buffer。
+        """
         try:
             zmq_server = getattr(self, "zmq_server", None)
             if zmq_server is not None:
@@ -3390,6 +4078,14 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             super().shutdown()
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
+        """执行一个 PEERH2H / PEERSSD2H op（本地主动侧入口）。
+
+        与其它 worker 不同：一次 op 可能横跨**多个对端节点**，
+        所以 op_parser 先按节点拆成多个 RDMATaskInfo，这里串行逐个执行；
+        任何一个节点失败就整体判定失败（但已传成功的部分不会回滚）。
+
+        返回 False 时基类 run() 会 put (op_id, False)，上层据此回退或重算。
+        """
         task_info_list = self.op_parser(transfer_op)
 
         start_time = time.time()
@@ -3426,6 +4122,18 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         task_info: RDMATaskInfo,
         transfer_type: TransferType,
         **kwargs,):
+        """执行一个"到某个对端节点"的批量传输（launch_transfer 实际调用的版本）。
+
+        PEERH2H：调 Mooncake 的 batch_transfer_sync_read 一次性搬完该节点的
+            所有段。这里特意包一层 ThreadPoolExecutor 是为了**能超时**：
+            Mooncake 的同步读在对端失联但 Redis TTL 未过期时会永久阻塞，
+            靠 future.result(timeout=RDMA_TRANSFER_TIMEOUT_SECONDS) 兜底。
+        PEERSSD2H：数据在对端磁盘上，本端搬不动，改为
+            step1 构造 RemoteSSD2HMetaInfo（含写到我哪个 CPU 地址、
+            完成后通知我哪个 ZMQ 地址）-> step2 ZMQ 发给对端
+            -> step3 阻塞等回执。（真正的搬运动作发生在对端的
+            ssd_handle_loop 里：读盘 + RDMA write 推回来。）
+        """
         if transfer_type == TransferType.PEERH2H:
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
@@ -3490,6 +4198,11 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         transfer_type: TransferType,
         **kwargs,
     ):
+        """单段（非批量）版本：与 _batch_transfer_impl 流程一致，
+        但 PEERH2H 走的是逐指针的 transfer_sync_read（一个指针一次调用），
+        而 _batch_transfer_impl 用 batch_transfer_sync_read 一次搞定。
+        当前 launch_transfer 走的是 batch 版本。
+        """
         if transfer_type == TransferType.PEERH2H:
             # remote cpu to local cpu transfer by one-side rdma read
             for i in range(len(task_info.src_ptrs)):
@@ -3557,6 +4270,11 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
             transfer_op (WorkerTransferOp): the transfer op to be parsed
         Returns:
             List[RDMATaskInfo]: the list of RDMATaskInfo
+
+        中文要点：这是"逻辑地址 -> 物理 RDMA 描述"的翻译层。
+        PEERH2H 用 group_blocks_by_node_and_segment（先按节点、再按**连续段**
+        分组，一段一次 RDMA，减少请求数）；
+        PEERSSD2H 只用 group_blocks_by_node（不分段，因为整包交给对端去读）。
         """
         assert (
             transfer_op.transfer_type == TransferType.PEERH2H
@@ -3611,6 +4329,10 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
 
         Returns:
             task_info_list: the list of RDMATaskInfo, each task refers to one data transfer operation
+
+        中文要点：SSD 场景下 RDMATaskInfo 里只需带 block id（不填指针）,
+        因为实际搬运在对端完成；peer_engine_addr 这里填的是**对端的**
+        engine 地址（用于 ZMQ 寻址），而 task_id 用来等对端回执。
         """
         ## parse ssd
         # TODO: now we only support blockwise layout, need support layerwise layout
@@ -3655,10 +4377,29 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
     #=============================remote behaviors
 
     def meta_info_parser(self, recv_msg: str):
+        """控制面：把对端发来的 JSON 反序列化成 RemoteSSD2HMetaInfo。"""
         recv_dict = json.loads(recv_msg)
         return RemoteSSD2HMetaInfo.from_dict(recv_dict)
 
     def ssd_handle_loop(self):
+        """**远端被动侧**的主循环：替对端把本地 SSD 数据读出来并 RDMA 推回去。
+
+        由 SSDZMQServer 在独立线程里驱动（见 __init__ 里传入的回调）。
+
+        处理一个请求的四个阶段：
+            step1 收 ZMQ 消息 -> meta_info_parser 反序列化 -> 立刻回 "OK"
+                  （先应答，避免对端死等）
+            step2 校验：block 数合法、且不超过 num_tmp_cpu_blocks
+                  （超限目前直接回失败，代码里有对应 TODO）
+            step3 copy_ssd_data_to_dram：用 io_uring 把 SSD 数据读到本地
+                  hugepage 临时缓冲（tmp_cpu_buffer）；同时按"最长连续段"
+                  切分（split_contiguous_blocks），一段一次批量 RDMA
+            step4 write_data_back_to_peer：batch_transfer_sync_write
+                  **单向 RDMA 写**把数据推进对端 CPU 缓冲 -> ZMQ 发回执
+
+        无论成功失败都必须发回执（包括异常分支），否则对端的
+        wait_transfer_notify 会一直挂着，整个 graph 永远完不成。
+        """
         flexkv_logger.info(
             f"Node {self.cache_config.distributed_node_id} Listening on {self.zmq_listen_addr}"
         )
@@ -3811,6 +4552,12 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
     def copy_ssd_data_to_dram(
         self, layer_id_list: torch.Tensor, ssd_block_id_list: torch.Tensor, cpu_block_id_list: torch.Tensor
     ):
+        """数据面（远端侧）：用 io_uring 把本地 SSD 的 block 读进 tmp_cpu_buffer。
+
+        走的是和 CPUSSDDiskTransferWorker 同一个 transfer_kv_blocks_ssd，
+        区别是目标缓冲是 hugepage 临时缓冲而不是 CPU KV 池——
+        因为这些数据马上要被 RDMA 推走，不占 KV 池的 block。
+        """
         assert len(ssd_block_id_list) == len(cpu_block_id_list)
         flexkv_logger.info(f"copy ssd blocks:{ssd_block_id_list} to cpu blocks: {cpu_block_id_list}" )
         try:
@@ -3845,6 +4592,12 @@ class PEER2CPUTransferWorker(TransferWorkerBase):
         dst_ptr_list: List[int],
         data_size_list: List[int]
     ):
+        """数据面（远端侧）：**单向 RDMA write** 把临时缓冲里的数据推进对端 CPU。
+
+        注意方向：PEERH2H 是本端 read 对端，PEERSSD2H 是本端（这里指服务方）
+        write 对端。用 write 是因为数据在本端手上、对端的目标地址由
+        meta 里的 peer_cpu_base_ptr 给出。
+        """
         flexkv_logger.info(
             f"Write data back to peer from src: {src_ptr_list} to {dst_ptr_list}"
         )
