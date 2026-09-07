@@ -18,6 +18,20 @@
 #   * block_hashes[i] = hash(token_ids[0 : (i+1) * tokens_per_block])，是前缀
 #     哈希而非单块哈希。详见 common/hash_utils.py 文件头注释。
 #
+# 一个 block "有多大"：blockwise 与 layerwise（决定 I/O 单位的大小）
+#   上面讲的是**横向**切分（按 token 切），纵向上（层方向）还有两种组织方式：
+#     blockwise —— 一个 block 内把**所有层**的 KV 连续堆叠，整块是一段连续内存。
+#                  FlexKV 的 CPU / SSD / 远端缓存默认走这条路，对应
+#                  KVCacheLayoutType.BLOCKFIRST（见 common/storage.py）。好处是
+#                  一批连续 block 只需算 1 个起始指针、一次 IO 就能搬完，I/O 单位
+#                  最大；对 SSD（需凑满物理块）和远端（高延迟、按次计费）尤其关键。
+#     layerwise —— 层在最外层，一个 block 只装某一层的数据。搬运时每个 block 要
+#                  按 (层, K/V) 拆出 num_layer * kv_dim 个起始指针，见
+#                  transfer/worker.py 的 get_cpu_buffer_block_start_ptr。好处是
+#                  可以算一层传一层、做流水线重叠，代价是 I/O 变碎。
+#   所以所谓 "block-wise 模式" 的本质就是：把多个 layer 合并进同一个 block，用
+#   内存连续性换取更大的单次 I/O 尺寸——这正是分层卸载最需要的性质。
+#
 # 在主链路中的位置：
 #   * 上游（构造方）：flexkv/cache/cache_engine.py、flexkv/cache/hie_cache_engine.py
 #     在 get / put 前构造 SequenceMeta；flexkv/kvtask.py 用 hash_token 生成

@@ -13,6 +13,75 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# ==============================================================================
+# 本文件职责：FlexKV 的**控制面核心** —— 决定「数据该从哪搬到哪、搬哪些 block」。
+#
+# 【控制面 vs 数据面 —— 阅读本文件的第一要义】
+#   本文件**不搬运任何一个字节**。它只做三件事：
+#       1. 在各级缓存的 radix tree 上做前缀匹配（match），算出命中了多少 block；
+#       2. 决定搬运路径（CPU / SSD / REMOTE -> CPU 内存 -> GPU）与所需中转 block；
+#       3. 把决策编译成一张传输 DAG —— TransferOpGraph（节点 = TransferOp，
+#          边 = 依赖），连同"传输完成后要执行的回调"一起交给调用方。
+#   真正的搬运由数据面完成：TransferEngine -> Worker -> c_ext（DMA / GDS / RDMA）。
+#   因此本文件里所有的 src_block_ids / dst_block_ids 都只是"物理 block 编号"，
+#   不是 KV 数据本身。
+#
+# 在系统链路中的位置：
+#   KVManager(kvmanager.py) -> KVTaskEngine(kvtask.py)
+#     -> 【本文件 GlobalCacheEngine】 -> TransferOpGraph
+#     -> TransferEngine(transfer/transfer_engine.py) -> Worker -> c_ext
+#
+# 三级缓存与索引：
+#   CPU 内存 / 本地 SSD / 远端存储每个 tier 各持有一个 CacheEngine 实例，
+#   GlobalCacheEngine 按 DeviceType 存在 cpu_cache_engine / ssd_cache_engine /
+#   remote_cache_engine（见 __init__ 约 912 行起），并在 cache_engines 字典里维护
+#   DeviceType -> engine 的映射。每个 engine = RadixTree（前缀匹配）
+#   + Mempool（block 分配与淘汰触发）。
+#
+# 核心内容速查表：
+#   - CacheEngineAccel       : 单 tier 引擎，radix 索引为 C++ 实现（CRadixTreeIndex）
+#   - CacheEngine            : 单 tier 引擎，radix 索引为 Python 实现（RadixTreeIndex）
+#   - HierarchyLRCacheEngine : 分布式版（P2P / Redis 元信息），见 cache/hie_cache_engine.py
+#   - CacheStrategy          : 单次请求的开关（是否忽略 GPU / SSD / REMOTE / GDS）
+#   - GlobalCacheEngine      : 顶层编排，本文件主角
+#       .get()                  : 读路径入口，返回 (DAG, return_mask, callback,
+#                                 op_callback_dict, task_end_op_id)
+#       .put()                  : 写路径入口，把 GPU 上的新 KV 下沉到 CPU / SSD / REMOTE
+#       ._get_impl_local()      : 只在 CPU / SSD（含 peer）里匹配，不查远端
+#       ._get_impl_global()     : CPU / SSD / REMOTE 三级一起匹配（远端参与）
+#       ._put_impl_local()      : 写入 CPU / SSD
+#       ._put_impl_global()     : 写入 CPU / SSD / REMOTE
+#       ._commit_deferred_insert(): 传输完成后才把 block 挂上 radix tree（延迟上树）
+#       ._transfer_callback()   : 整图完成后的收尾（解锁 / 置 ready / 回收 buffer）
+#       ._abort_transfer_plan() : 图未提交就被取消时的回滚
+#       ._op_callback()         : 单个 op 完成后把对应节点置为 ready
+#
+# 五种核心语义（贯穿全文件，先弄懂再读代码）：
+#   - match  : 前缀匹配。返回命中 block 数、命中节点上的 physical_blocks，
+#              以及 last_node / last_ready_node 等插入锚点。
+#   - insert : 把一段 (hash 序列 -> physical blocks) 挂到 radix tree 上。
+#              is_ready=False 表示"节点已上树，但数据还没写进去"。
+#   - evict  : 由 take() 在空间不足时触发，按 LRU / LFU / SLRU 等策略淘汰节点，
+#              把 block 回收进 mempool。
+#   - lock   : 对 radix 节点加引用计数锁，使它在本次请求完成前不可被淘汰。
+#   - ready  : set_ready(node, True, len) 把节点标记为"数据已就绪、可被后续请求
+#              命中"。未 ready 的块不计入 num_ready_matched_blocks。
+#
+# 阅读提示 / 常见坑：
+#   1. fragment 命名法：fragment1 = 只有 CPU 命中的部分；fragment2 = CPU 未命中但
+#      SSD 命中的部分；fragment3 = CPU / SSD 都未命中但远端命中的部分。
+#      fragment12 = fragment1 + fragment2，fragment123 同理。
+#   2. SSD / 远端的数据不会直接进 GPU，必须先落到 CPU 内存（DISK2H / REMOTE2H），
+#      再统一 H2D 上 GPU —— CPU 内存是唯一的中转层（GDS 例外，可 DISK2D 直通）。
+#   3. 上树时机：多数路径在**规划阶段**就 insert（is_ready=False），等 op 完成回调
+#      再 set_ready；mooncake 远端路径例外，走"延迟上树"
+#      （DeferredCacheInsert + _commit_deferred_insert），见相关注释。
+#   4. 规划阶段与回调阶段操作同一棵 radix tree，而 pybind 会释放 GIL，
+#      故相关方法都套了 @_synchronized_cache_tree 做串行化。
+#   5. GPU 侧 block 由 slot_mapping 换算而来（slot_mapping_to_block_ids），
+#      本文件不负责 GPU 显存的分配与淘汰。
+# ==============================================================================
+
 import logging
 import threading
 import time
@@ -55,6 +124,9 @@ DEVICE_TYPE: List[str] = ['CPU', 'GPU', 'SSD', 'REMOTE']
 _VALID_EVICTION_POLICIES = {'lru', 'lfu', 'slru', 'fifo', 'mru', 'filo'}
 
 
+# 为什么需要这把锁：radix tree 的 match / insert / evict 经 pybind 进入 C++ 时会
+# 释放 GIL，规划阶段（get/put）与完成阶段（回调里的 rematch + insert）因此可能
+# 并发踩同一棵树。这里用可重入锁把"规划"和"完成期变更"两段都串起来。
 def _synchronized_cache_tree(method: Callable) -> Callable:
     """Serialize radix-tree planning and completion-time mutations."""
     @wraps(method)
@@ -64,6 +136,9 @@ def _synchronized_cache_tree(method: Callable) -> Callable:
     return wrapped
 
 
+# 记录一次 mooncake（远端 KV store）REMOTE2H 的逐 block 成败，由 CompletionAwareCallback
+# 在 op 完成时回填。远端读可能"整体报成功但部分 block 失败"，所以下游只能按
+# successful_prefix() 得到的最长**连续成功前缀**来用，不能按总数用。
 @dataclass
 class MooncakeLoadResult:
     """Per-request Mooncake outcome populated by the REMOTE2H callback."""
@@ -86,6 +161,9 @@ class MooncakeLoadResult:
         return prefix
 
 
+# "延迟上树"这条路径上，radix tree 最终真正挂载了多少远端 block 的回执。
+# 注意它和 MooncakeLoadResult 的区别：传输成功 != 树上可见（rematch/insert 可能
+# 被并发写入挤掉），所以预取任务的 return_mask 要取两者较小值。
 @dataclass
 class DeferredPublishResult:
     """CPU radix publication outcome for a deferred Mooncake load.
@@ -113,6 +191,9 @@ class DeferredPublishResult:
         self.record(0, reason=reason, failed=True)
 
 
+# 一条"待发布"的上树记录：规划阶段先把 block 分配出来但**不挂到 radix tree 上**，
+# 等整图传输完成（_transfer_callback）后再由 _commit_deferred_insert 决定挂多少。
+# 这样设计的原因见 _commit_deferred_insert 的注释。
 @dataclass(frozen=True)
 class DeferredCacheInsert:
     """Detached tier blocks published by the graph-completion callback.
@@ -150,6 +231,18 @@ class DeferredCacheInsert:
 
 @dataclass
 class GetTransferPlan:
+    """一次 GET 规划的完整产物 —— 控制面交给数据面的全部信息。
+
+    字段含义：
+        transfer_graph            : 要执行的传输 DAG
+        finished_ops_ids          : 「跑完即代表本请求完成」的 op（会合成一个虚拟汇点）
+        node_to_unlock            : 规划期锁住的 radix 节点，完成后解锁
+        op_callback_dict          : op_id -> 回调（多为 set_ready / SWA 锁释放）
+        buffer_to_free            : 未能上树、完成后要归还 mempool 的中转 block
+        num_gpu_blocks_to_transfer: 本次真的往 GPU 搬了多少 block（决定 return_mask）
+        deferred_inserts          : 需要延迟上树的记录
+        swa_reservation           : SWA 读占用的源节点 pin / 暂存槽，完成后释放
+    """
     transfer_graph: TransferOpGraph
     finished_ops_ids: List[int]
     node_to_unlock: Dict[DeviceType, Tuple[object, int]]
@@ -175,6 +268,14 @@ class GetTransferPlan:
 
 @dataclass
 class PutTransferPlan:
+    """一次 PUT 规划的完整产物，结构同 GetTransferPlan。
+
+    差异字段：
+        skipped_gpu_blocks: GPU 上已缓存（无需重复下沉）的头部 block 数，
+                            用于把 return_mask 右移到真正搬运的区间
+        swa_slots_to_free : 预留了但尚未挂载到节点上的 SWA 槽位，
+                            回滚路径必须把它们还给 host pool
+    """
     transfer_graph: TransferOpGraph
     finished_ops_ids: List[int]
     node_to_unlock: Dict[DeviceType, Tuple[object, int]]
@@ -202,6 +303,11 @@ class PutTransferPlan:
 
 @dataclass
 class SWAReadSource:
+    """SWA（Sliding Window Attention）读路径选中的快照来源。
+
+    SWA 只需一个"窗口快照"而非完整前缀，所以按 tier 各自独立选源，
+    与 Full-KV 的 fragment 划分解耦。
+    """
     hit_blocks: int = 0
     host_slot: int = -1
     node: Optional[object] = None
@@ -225,6 +331,8 @@ class SWAReadSource:
         return self.host_slot >= 0 and self.node is not None
 
 
+# SWA 读期间持有的资源集合：源节点 pin + 可能存在的 CPU 暂存槽 + 对应的 H2D op。
+# 传输完成或计划取消时统一释放（_swa_release_load_lock）。
 @dataclass(frozen=True)
 class SWAReadReservation:
     """Pinned SWA source plus any transient CPU staging slot and graph op."""
@@ -233,6 +341,8 @@ class SWAReadReservation:
     h2d_id: int
 
 
+# 一个"二选一且只执行一次"的完成句柄：正常完成走 __call__()，计划被取消走 abort()。
+# 二者互斥由 _consumed 保证 —— 防止 cancel 与 completion 并发导致重复解锁 / 重复回收。
 class TransferPlanHandle:
     """Completion callback for a planned get/put, with an abort path.
 
@@ -270,6 +380,29 @@ class TransferPlanHandle:
 
 
 class CacheEngineAccel:
+    """单个缓存层级（CPU / SSD / REMOTE 之一）的缓存引擎 —— C++ radix 索引版。
+
+    职责（纯控制面）：维护"本 tier 上有哪些 KV block"，提供
+    match / insert / take / recycle / lock / set_ready 这组语义。它只记录
+    block 编号与树结构，不接触任何 KV 字节。
+
+    与 CacheEngine（Python 索引版，见下）的差异 —— 二者接口完全一致、
+    可互换，差异集中在索引实现与数据表示：
+        1. 索引：CRadixTreeIndex（C++，csrc/radix_tree.h） vs RadixTreeIndex（Python）
+        2. 进出索引的张量：torch.Tensor（int64） vs np.ndarray
+        3. match 返回值：MatchResultAccel vs MatchResult
+           （Accel 版额外带 block_node_ids、SWA 命中信息）
+        4. take/evict 需要用预分配的 torch 缓冲区接收结果，且 evict 会
+           **就地 resize** 缓冲区（见 take 内注释）；Python 版直接返回 numpy 数组
+        5. 本版是维护中的主路径；CacheEngine 是 legacy Python mirror
+
+    组成：
+        index   : radix tree，做前缀匹配、承载节点锁与 ready 标记
+        mempool : 本 tier 的物理 block 池，负责分配 / 回收 / 触发淘汰
+        swa_pool: SWA 快照槽位池（可选），槽位挂在 radix 节点上（node-mounted），
+                  与 Full-KV 共用同一棵树做淘汰，两个池不会漂移
+    """
+
     def __init__(self,
                  device_type: DeviceType,
                  num_total_blocks: int,
@@ -298,6 +431,7 @@ class CacheEngineAccel:
 
         self.device_type = device_type
 
+        # C++ radix 索引：前缀匹配 / 插入 / 淘汰 / 节点锁全在这里面完成
         self.index = CRadixTreeIndex(tokens_per_block, num_total_blocks, hit_reward_seconds, eviction_policy,
                                      protected_threshold)
 
@@ -407,6 +541,16 @@ class CacheEngineAccel:
             self.swa_pool.reset()
 
     def match(self, sequence_meta: SequenceMeta) -> MatchResultAccel:
+        """在本 tier 的 radix tree 上做最长前缀匹配（只命中"已 ready"的部分）。
+
+        Returns:
+            MatchResultAccel，含 num_matched_blocks / num_ready_matched_blocks、
+            命中的 physical_blocks，以及 last_node、last_ready_node 等插入锚点，
+            供后续 insert 复用以避免二次遍历。
+        Note:
+            本方法只读不写树结构（但会更新 LRU 命中信息），可并发安全调用的前提
+            是调用方持有 _cache_tree_lock。
+        """
         sequence_meta.gen_hashes()
         match_result = self.index.match_prefix(torch.from_numpy(sequence_meta.block_hashes).to(torch.int64),
                                               sequence_meta.num_blocks, True)
@@ -442,6 +586,17 @@ class CacheEngineAccel:
                num_insert_blocks: int = -1,
                is_ready: bool = True,
                match_result: Optional[MatchResultAccel] = None) -> Optional[CRadixNode]:
+        """把 (block hash 序列 -> physical blocks) 挂上 radix tree。
+
+        Args:
+            num_insert_blocks  : 要插入的 block 数；-1 表示整个序列
+            is_ready           : False = 节点先上树占位、数据尚未写入。
+                                 未 ready 的块不会被后续 match 计入
+                                 num_ready_matched_blocks，从而避免"命中脏数据"
+            match_result       : 复用上一次 match 的锚点，省掉一次树的查找
+        Returns:
+            插入/分裂后的叶子节点；冲突或空插入时返回 None
+        """
         sequence_meta.gen_hashes()
         if match_result is None:
             node = self.index.insert(torch.from_numpy(physical_block_ids).to(torch.int64),
@@ -477,6 +632,8 @@ class CacheEngineAccel:
     def set_ready(self, node: CRadixNode, ready: bool, ready_length: int) -> None:
         self.index.set_ready(node, ready, ready_length)
 
+    # 与 CacheEngine.take 逻辑完全一致（详见那里的注释），差异仅在索引实现：
+    # 这里用 torch 缓冲区接收 evict 结果，且 evict 会就地 resize 缓冲区。
     def take(self,
              num_required_blocks: int,
              protected_node: Optional[CRadixNode] = None,
@@ -601,6 +758,29 @@ class CacheEngineAccel:
         return num_freed
 
 class CacheEngine:
+    """单个缓存层级（CPU / SSD / REMOTE 之一）的缓存引擎 —— Python radix 索引版。
+
+    与 CacheEngineAccel 接口完全一致、可互换，索引改为 Python 实现的
+    RadixTreeIndex（flexkv/cache/radixtree.py），进出用 np.ndarray。
+    两者的选择开关在 GlobalCacheEngine.__init__：
+        enable_p2p_* -> HierarchyLRCacheEngine（分布式版）
+        index_accel  -> CacheEngineAccel
+        否则          -> 本类（legacy Python mirror）
+
+    引擎维护三样东西：
+        index    : RadixTreeIndex，前缀匹配 + 节点锁 + ready 标记
+        mempool  : Mempool，本 tier 物理 block 的分配 / 回收 / 空闲量追踪
+        swa_pool : SWA 快照槽位池（可选）
+
+    对外语义速查（全局通用，不只是本类）：
+        match(sequence_meta)                  -> MatchResult，前缀匹配
+        insert(..., is_ready=False)           -> 上树占位（数据未就绪）
+        take(n, protected_node)               -> 申请 n 个 block，不够就先淘汰
+        recycle(blocks)                       -> 归还 block 给 mempool
+        lock_node(node) / unlock(node)        -> 锁住节点，防止被淘汰
+        set_ready(node, True, ready_length)   -> 标记数据就绪，此后才可被命中
+    """
+
     def __init__(self,
                  device_type: DeviceType,
                  num_total_blocks: int,
@@ -731,6 +911,17 @@ class CacheEngine:
             self.swa_pool.reset()
 
     def match(self, sequence_meta: SequenceMeta) -> MatchResult:
+        """在本 tier 的 radix tree 上做最长前缀匹配。
+
+        Args:
+            sequence_meta: 本次请求的 token 序列元信息，内部会惰性生成 block_hashes
+        Returns:
+            MatchResult：num_matched_blocks（含未 ready）/ num_ready_matched_blocks
+            （可立即使用）、physical_blocks（命中块编号）、last_node / last_ready_node
+        Note:
+            只有 num_ready_matched_blocks 个块是真能读的；未 ready 的块是别人正在
+            写、还没写完的。调用方（GlobalCacheEngine）一律按 ready 数量切分。
+        """
         match_result = self.index.match_prefix(sequence_meta,
                                               update_cache_info=True)
         return match_result
@@ -741,6 +932,17 @@ class CacheEngine:
                num_insert_blocks: int = -1,
                is_ready: bool = True,
                match_result: Optional[MatchResult] = None) -> Optional[RadixNode]:
+        """把 (block hash 序列 -> physical blocks) 挂上 radix tree。
+
+        Args:
+            physical_block_ids : 这些 hash 对应的物理 block 编号
+            num_insert_blocks  : 插入多少个 block；-1 = 整条序列
+            is_ready           : False 表示"节点先上树占位，数据还没写完"。
+                                 此时节点可见但不可命中，写完由 set_ready 打开
+            match_result       : 复用上次 match 的锚点，省一次树查找
+        Returns:
+            新插入（或分裂出的）叶子节点；插入失败 / 冲突时返回 None
+        """
         node = self.index.insert(sequence_meta,
                                  physical_block_ids,
                                  num_insert_blocks=num_insert_blocks,
@@ -766,6 +968,20 @@ class CacheEngine:
              num_required_blocks: int,
              protected_node: Optional[RadixNode] = None,
              strict: bool = True) -> np.ndarray:
+        """申请 num_required_blocks 个空闲 block，空间不足时先淘汰再分配。
+
+        Args:
+            num_required_blocks: 需要的 block 数
+            protected_node     : 淘汰期间要保护的节点（通常是本次 match 命中的
+                                 last_node）。淘汰可能误伤它，故先 lock 再 evict
+            strict             : True 时若最终仍不够则 raise RuntimeError；
+                                 False 则返回能拿到的数量（可能少于请求量）
+        Returns:
+            分配到的 block 编号数组（长度 <= num_required_blocks）
+        Note:
+            淘汰是"预防式"的：只要利用率超过 evict_start_threshold 或当前需求
+            得不到满足就触发，一次多淘汰一些，避免每来一个请求就淘汰一次。
+        """
         # Calculate current utilization
         utilization = ((self.mempool.num_total_blocks - self.mempool.num_free_blocks)
                        / self.mempool.num_total_blocks) if self.mempool.num_total_blocks > 0 else 0
@@ -792,6 +1008,8 @@ class CacheEngine:
             if evict_block_num > 0:
                 free_before = self.mempool.num_free_blocks
                 start_ns = time.perf_counter_ns()
+                # 淘汰由 radix tree 按 LRU/LFU/SLRU 策略挑节点，返回被踢掉的
+                # block 编号与对应 hash（hash 用于向外部发 KV 事件）
                 evicted_blocks, evicted_block_hashes = self.index.evict(evict_block_num)
                 self.mempool.recycle_blocks(evicted_blocks)
 
@@ -868,6 +1086,11 @@ class CacheEngine:
 
 @dataclass
 class CacheStrategy:
+    """单次 get/put 的策略开关，用来临时屏蔽某些介质或通道。
+
+    典型用法：预取任务设 ignore_gpu=True（只搬到 CPU，不上 GPU）；
+    compute 侧的正常 GET 则全开。
+    """
     # if True, will not put or get blocks from GPU
     ignore_gpu: bool = False
     # if True, will not put or get blocks from SSD
@@ -882,6 +1105,9 @@ DEFAULT_CACHE_STRATEGY = CacheStrategy()
 CPUONLY_CACHE_STRATEGY = CacheStrategy(ignore_gpu=False, ignore_ssd=True, ignore_remote=True, ignore_gds=True)
 
 
+# mooncake（远端 KV store）启用时的 GET 策略修正：预取（ignore_gpu=True）才允许
+# 走 REMOTE2H；compute 侧的 GPU 绑定 GET 强制忽略远端，宁可当作 CPU miss 去重算，
+# 也不能在图里插一条阻塞的 REMOTE2H。
 def resolve_get_cache_strategy(
         use_mooncake_store_backend: bool,
         temp_cache_strategy: CacheStrategy) -> CacheStrategy:
@@ -900,6 +1126,36 @@ def resolve_get_cache_strategy(
 
 
 class GlobalCacheEngine:
+    """顶层缓存编排器 —— 整个 FlexKV 控制面的大脑。
+
+    职责：
+        把一次 get / put 请求翻译成一张传输 DAG（TransferOpGraph）+ 一组回调，
+        自己**不搬运任何字节**。搬运由数据面 TransferEngine / Worker 执行。
+
+    它手里有什么：
+        cpu_cache_engine    : CPU 内存层（DeviceType.CPU）
+        ssd_cache_engine    : 本地 SSD 层（DeviceType.SSD）
+        remote_cache_engine : 远端存储层（DeviceType.REMOTE）
+        cache_engines       : {DeviceType -> engine} 映射
+        _cache_tree_lock    : 串行化"规划"与"完成期树变更"的可重入锁
+        每个 engine 可以是 CacheEngineAccel / CacheEngine / HierarchyLRCacheEngine
+        / MooncakeStoreCacheEngine 之一，按配置三选一（见 __init__）。
+
+    两条主路径：
+        get()  -> _get_impl_local()  （不查远端：CPU/SSD 及 peer 节点）
+               -> _get_impl_global() （CPU/SSD/REMOTE 三级一起匹配）
+        put()  -> _put_impl_local()  （下沉到 CPU/SSD）
+               -> _put_impl_global() （再下沉到 REMOTE）
+
+    三个关键设计（新手最容易困惑的地方）：
+        1) 所有数据都要经 CPU 内存中转：SSD/REMOTE 的块先 DISK2H/REMOTE2H 落到
+           CPU，再统一 H2D 上 GPU。只有 GDS 例外（DISK2D 直通 GPU）。
+        2) 上树与搬理解耦：规划阶段就把目标节点 insert 到 radix 树（is_ready=
+           False 占位），传输完成回调再 set_ready 打开可见性。
+        3) mooncake 远端走"延迟上树"：规划阶段完全不上树，等图完成后
+           _commit_deferred_insert 重新 match 再决定挂多少（见该方法注释）。
+    """
+
     def __init__(self, cache_config: CacheConfig, model_config: ModelConfig, redis_meta: RedisMeta = None,
                  event_collector: Optional[KVEventCollector] = None):
         # pybind releases the GIL around radix match/insert/evict. Protect the
@@ -954,6 +1210,11 @@ class GlobalCacheEngine:
                 "(e.g. libhiredis-dev, redis-tools). See README for full list."
             )
 
+        # 三种引擎实现的选择开关（每个 tier 独立三选一）：
+        #   enable_p2p_*  -> HierarchyLRCacheEngine（分布式，走 Redis 元信息 + P2P）
+        #   index_accel   -> CacheEngineAccel      （C++ radix 索引，主路径）
+        #   否则           -> CacheEngine           （Python radix 索引，legacy）
+        # REMOTE tier 还多一种：mooncake store 后端（use_mooncake_store_backend）。
         if cache_config.enable_cpu:
             if cache_config.enable_p2p_cpu:
                 self.cpu_cache_engine = HierarchyLRCacheEngine.from_cache_config(
@@ -1067,6 +1328,8 @@ class GlobalCacheEngine:
         #TODO move this to kvmanager.start()
         self.start()
 
+        # 空计划工厂：任何"规划失败 / 无需搬运"的早退路径都返回它 ——
+        # 空图 + 空 mask + 空回调，让上层的任务收尾逻辑保持统一。
         self._empty_get_return: Callable[[int], GetTransferPlan] = \
             lambda request_id: GetTransferPlan.empty()
         self._empty_put_return: Callable[[int], PutTransferPlan] = \
@@ -1116,8 +1379,42 @@ class GlobalCacheEngine:
             namespace: Optional[List[str]] = None,
             swa_aware: bool = False) \
                  -> Tuple[TransferOpGraph, np.ndarray, Callable, Dict, int]:
+        """GET 主入口：为一次前缀复用请求规划出传输 DAG。
+
+        完整决策流程：
+            1. 对齐到 block 粒度：不足一个 block 的尾部 token 直接放弃
+               （KV Cache 以 block 为最小单位，半个块无法复用）。
+            2. 由 token_mask 求出需要搬运的 block 区间
+               [block_start_idx, block_end_idx)，并把 slot_mapping 换算成
+               GPU 侧的目标 block 编号。
+            3. 分派到 _get_impl_local / _get_impl_global 做真正的匹配与建图。
+            4. 给所有 finished_ops 加一个虚拟汇点，得到 task_end_op_id
+               （上层据此判断任务何时完成）。
+            5. 计算 return_mask：告诉上层"哪些 token 不用重算了"。
+            6. 锁住规划期用到的 radix 节点，并打包完成/回滚回调。
+
+        Args:
+            token_ids / token_mask : 本次请求的 token 与"需要 KV"的掩码。
+                                     mask 为 True 表示该 token 需要从缓存拉
+            slot_mapping           : GPU 侧 KV Cache 的槽位映射，用于换算
+                                     数据要写到 GPU 的哪些 block
+            dp_client_id           : 数据并行客户端 id，随 op 透传给数据面
+            temp_cache_strategy    : 本次请求的临时策略（是否忽略 GPU/SSD/REMOTE）
+            swa_aware              : 是否同时规划 SWA（滑动窗口注意力）快照
+
+        Returns:
+            (transfer_graph, return_mask, callback, op_callback_dict, task_end_op_id)
+            - return_mask 为 True 的 token 已由本图搬到位，无需重算
+            - callback 即 TransferPlanHandle：正常完成调它，取消则调 .abort()
+
+        Side effects:
+            可能已在各级 radix 树上 insert 了 is_ready=False 的占位节点、
+            分配了 CPU/SSD 中转 block、并对匹配节点加了锁 —— 这些全部由
+            callback / abort 负责收尾。
+        """
         self._check_input(token_ids, token_mask, slot_mapping)
 
+        # 只按整 block 处理：尾部不足一个 block 的 token 无法复用，直接掩掉
         aligned_length = (token_ids.shape[0] // self.tokens_per_block) * self.tokens_per_block
 
         aligned_token_ids = token_ids[:aligned_length]
@@ -1148,6 +1445,8 @@ class GlobalCacheEngine:
         temp_cache_strategy = resolve_get_cache_strategy(
             self.use_mooncake_store_backend, temp_cache_strategy)
 
+        # 分派：远端不可用或本次策略忽略远端 -> 本地路径（CPU/SSD + peer）；
+        # 否则走全局路径，把 REMOTE 也纳入匹配。两条路径产出同一种 GetTransferPlan。
         if not self.cache_config.enable_remote or temp_cache_strategy.ignore_remote:
             # from this entrance, we will also handle the case of peer_cpu and peer_ssd
             plan = self._get_impl_local(
@@ -1173,6 +1472,7 @@ class GlobalCacheEngine:
                 swa_aware=swa_aware,
             )
 
+        # 把所有 finished_ops 汇聚成一个虚拟 op，作为整张图的完成标记
         transfer_graph, task_end_op_id = add_virtual_op_for_multiple_finished_ops(
             plan.transfer_graph,
             plan.finished_ops_ids,
@@ -1181,6 +1481,8 @@ class GlobalCacheEngine:
 
         return_mask = np.zeros_like(token_mask, dtype=np.bool_)
         if temp_cache_strategy.ignore_gpu and temp_cache_strategy.ignore_gds:
+            # 预取路径：只统计 Full REMOTE2H 搬下来的块（SWA 的 op 在另一个
+            # slot 空间，不能混进来），并把 mask 对齐到远端片段的起点。
             # Prefetch return_mask covers Full REMOTE2H tokens only (A: planned
             # remote pull). SWA REMOTE2H ops live in a separate slot space and
             # must not be summed into prefetch_blocks. Place the True span at
@@ -1208,6 +1510,8 @@ class GlobalCacheEngine:
         #                                                                         layer_num=layer_num,
         #                                                                         layer_granularity=layer_granularity)
 
+        # 规划期锁住各 tier 上命中/插入的节点，防止数据在搬运途中被淘汰；
+        # 解锁与置 ready 都推迟到完成回调（_transfer_callback）里做。
         for device_type in plan.node_to_unlock:
             self.cache_engines[device_type].lock_node(plan.node_to_unlock[device_type][0])
 
@@ -1232,6 +1536,11 @@ class GlobalCacheEngine:
         return transfer_graph, return_mask, callback, op_callback_dict, task_end_op_id
 
     def _build_op_callback_dict(self, op_node_to_ready: Dict) -> Dict[int, Callable]:
+        """把 {op_id: (device_type, node, ready_length)} 编译成 {op_id: 回调}。
+
+        语义：某个 op 完成 == 它写往的那批 block 数据已落盘/落内存，
+        于是把对应 radix 节点标记为 ready，从此可被后续请求命中。
+        """
         op_callback_dict = {}
         for op_id, (device_type, node_to_ready, ready_length) in op_node_to_ready.items():
             op_callback_dict[op_id] = partial(self._op_callback,
@@ -1256,6 +1565,9 @@ class GlobalCacheEngine:
 
         op_callback_dict[op_id] = combined_callback
 
+    # SWA 槽位的"延迟挂载"：槽号必须在建图前就定下来（数据面要用它寻址），
+    # 但要等本 tier 的传输完成回调才真正挂到 radix 节点上。这样 Full-KV 与
+    # SWA 的发布互不依赖 —— 谁先写完都不影响，也不会暴露未写完的 SWA 字节。
     @_synchronized_cache_tree
     def _publish_swa_put_slot(self,
                               device_type: DeviceType,
@@ -1283,6 +1595,11 @@ class GlobalCacheEngine:
             ssd_swa_slot: int = -1,
             remote_blocks: Optional[np.ndarray] = None,
             remote_swa_slot: int = -1) -> PutTransferPlan:
+        """PUT 在 insert 之前失败的统一收尾：归还已申请的 block 与 SWA 槽位。
+
+        典型触发原因是 SWA 槽位分配失败。此时还没有任何节点上树，
+        所有资源都还属于本次请求，可以安全全量回收后返回空计划。
+        """
         flexkv_logger.warning(
             "[FlexKV-SWA] PUT request failed before radix insert; "
             f"request_id={request_id}, reason={reason}, "
@@ -1304,6 +1621,24 @@ class GlobalCacheEngine:
             self.remote_cache_engine.recycle(remote_blocks)
         return self._empty_put_return(request_id)
 
+    # ------------------------------------------------------------------
+    # 全局（分布式 / 含远端）GET 路径：CPU / SSD / REMOTE 三级一起参与匹配
+    #
+    # 决策思路（对照下面的 transfer pattern 图）：
+    #   1. 三级各自做一次前缀匹配，得到三个"命中长度"；
+    #   2. 因为缓存是分层的、命中必然是前缀，三级命中长度天然可比：
+    #      CPU 命中最短的是 fragment1，SSD 比 CPU 多出来的那段是 fragment2，
+    #      REMOTE 比 CPU/SSD 并集多出来的那段是 fragment3；
+    #   3. fragment1 已在 CPU 内存里，直接 H2D；
+    #      fragment2 需要 DISK2H（SSD -> CPU）再 H2D；
+    #      fragment3 需要 REMOTE2H（远端 -> CPU）再 H2D；
+    #   4. 从远端拉回来的数据顺手 H2DISK 回填 SSD（下次就不用再走远端）；
+    #   5. 所有 fragment 在 CPU 内存中拼成一段连续区间，最后统一一次 H2D 上 GPU。
+    #
+    # 与 _get_impl_local 的区别：
+    #   本路径多一层 REMOTE 参与，且会把远端数据回填 SSD；适合开了
+    #   enable_remote 且本次策略未忽略远端的场景（多为预取任务）。
+    # ------------------------------------------------------------------
     def _get_impl_global(self,
             request_id: int,
             sequence_meta: SequenceMeta,
@@ -1389,6 +1724,8 @@ class GlobalCacheEngine:
 
         finished_ops_ids = []
 
+        # 三级命中长度的"并集切分"：因为命中都是前缀，短的必然被长的包含，
+        # 所以可以直接用"更深层命中数 - 浅层命中数"得到各 fragment 的长度。
         fragment1_num_blocks = len(cpu_matched_blocks)
         fragment2_num_blocks = max(len(ssd_matched_blocks) - len(cpu_matched_blocks), 0)
         fragment12_num_blocks = max(len(cpu_matched_blocks), len(ssd_matched_blocks))
@@ -1412,6 +1749,8 @@ class GlobalCacheEngine:
         ssd_node_to_ready = None
 
         if fragment23_num_blocks > 0:
+            # CPU 内存是唯一的中转层：SSD 和远端的数据都要先落到这里，
+            # 所以先按 fragment2 + fragment3 的总量申请 CPU block（可能触发淘汰）
             num_extra_required_blocks = fragment23_num_blocks
             try:
                 fragment23_cpu_blocks = self.cpu_cache_engine.take(
@@ -1479,6 +1818,8 @@ class GlobalCacheEngine:
 
         op_remote2h = None
         if fragment3_num_blocks > 0:
+            # mooncake 是"按 key 寻址"的远端存储：地址只有 block hash 的尾值，
+            # 没有 radix 节点 / host slot，所以额外带上 hash 列表作为远端句柄
             mooncake_block_hashes = None
             if self.use_mooncake_store_backend:
                 mooncake_block_hashes = sequence_meta.block_hashes[
@@ -1496,6 +1837,9 @@ class GlobalCacheEngine:
             )
             transfer_graph.add_transfer_op(op_remote2h)
 
+        # 回填 SSD：把从远端拉回来的 fragment3 顺手 H2DISK 写进本地 SSD，
+        # 下次同样前缀就不用再走远端。条件很苛刻 —— 必须 SSD 上已有的缓存
+        # 正好构成本次命中的连续前缀，否则接上去会破坏 radix 树的前缀连续性。
         # prepare ssd blocks to transfer
         write_ssd_blocks_from_remote = False
         if (enable_ssd and
@@ -1542,6 +1886,13 @@ class GlobalCacheEngine:
         # the CPU pool.  A virtual join preserves parallel SSD and remote IO.
         # Mooncake insert-after skips plan-time insert, so cpu/ssd_node_to_ready
         # stay None and these set_ready callbacks are not registered.
+        # 预取任务没有 H2D，所以它的"终止 op"只能是 host 侧的传输本身。
+        # 这里给 DISK2H / REMOTE2H 加一个虚拟汇点，等 host 侧全部落盘后再统一
+        # 把规划期 insert 的 is_ready=False 节点置为 ready —— 否则未 ready 节点
+        # 会不断堆积、既不能被命中也不能被淘汰，最终耗尽 CPU 池。
+        # 用虚拟汇点而非串行依赖，是为了保留 SSD 与远端 IO 的并行度。
+        # Mooncake 走延迟上树（规划期不 insert），故 cpu/ssd_node_to_ready 为 None，
+        # 这些 set_ready 回调也就不会注册。
         op_callback_dict = {}
         host_finished_ops_ids = [
             op.op_id for op in (op_disk2h, op_remote2h) if op is not None
@@ -1578,6 +1929,8 @@ class GlobalCacheEngine:
                 ),
             )
         if enable_gpu:
+            # 统一 H2D：CPU 内存里已经拼成连续区间，一次搬上 GPU。
+            # 依赖边确保 H2D 一定在 DISK2H / REMOTE2H 之后执行。
             op_h2d = TransferOp(
                 graph_id = transfer_graph.graph_id,
                 transfer_type = TransferType.H2D,
@@ -1715,6 +2068,34 @@ class GlobalCacheEngine:
             swa_reservation=swa_reservation,
         )
 
+    # ------------------------------------------------------------------
+    # 本地 GET 路径：只在 CPU 内存 / 本地 SSD（以及 peer 节点）里匹配，不查远端
+    #
+    # 决策流程（对照下面的 transfer pattern 图）：
+    #   1. CPU 与 SSD 各做一次前缀匹配，取"已 ready"的部分并裁剪到本次 mask 区间；
+    #   2. 切分 fragment：
+    #        fragment1 = CPU 命中的块（已在内存，可直接 H2D）
+    #        fragment2 = CPU 没命中、SSD 命中的块（需先搬到内存）
+    #      两者构成一段连续前缀 fragment12 = fragment1 + fragment2；
+    #   3. 申请 CPU 中转 block（只在真的需要经内存中转时才申请 —— GDS 可以
+    #      SSD 直通 GPU，就一分 CPU block 都不用）；
+    #   4. 建图：
+    #        GDS 开启 ：fragment2 走 DISK2D（SSD -> GPU 直通）
+    #        否则     ：fragment2 走 DISK2H（SSD -> CPU），再统一 H2D
+    #        peer 命中：CPU 走 PEERH2H、SSD 走 PEERSSD2H（从别的节点搬）
+    #   5. 把 fragment2 的中转 block insert 进 CPU radix 树（is_ready=False），
+    #      并登记 op -> node 的回调，等 DISK2H 完成后 set_ready；
+    #   6. 最后一条 H2D 把整段搬上 GPU，并作为本请求的 finished op。
+    #
+    # 与 _get_impl_global 的区别：
+    #   本路径不查远端、没有 fragment3、也不会把数据回填 SSD；peer 节点
+    #   （HierarchyLRCacheEngine）也算在本地路径里，通过 matched_pos=="remote"
+    #   区分"命中落在别的节点上"。适用场景：未开启远端，或本次策略忽略了远端。
+    #
+    # 一个容易踩的坑：中转 block 只有在满足"插入后仍是连续前缀"且"命中部分
+    # 全部 ready"时才 insert 上树，否则只能标记为 buffer_to_free，传输完成后
+    # 直接还给 mempool —— 不能把断裂的前缀挂到树上。
+    # ------------------------------------------------------------------
     def _get_impl_local(self,
                         request_id: int,
                         sequence_meta: SequenceMeta,
@@ -1800,6 +2181,7 @@ class GlobalCacheEngine:
 
         fragment12_num_blocks = max(len(cpu_matched_blocks), len(ssd_matched_blocks))
         fragment1_num_blocks = len(cpu_matched_blocks)
+        # 命中必然是前缀，所以 SSD 比 CPU 多出来的那一段就是"只有 SSD 有"的部分
         fragment2_num_blocks = max(len(ssd_matched_blocks) - len(cpu_matched_blocks), 0)
         #early return if no blocks to transfer
         if fragment12_num_blocks == 0:
@@ -1897,6 +2279,7 @@ class GlobalCacheEngine:
 
         if fragment2_num_blocks > 0:
             if enable_gds:
+                # GDS：GPU 直接从 SSD 读，跳过 CPU 内存中转，省一次拷贝
                 # For GDS, transfer directly from SSD to GPU using GDS transfer path (DISK2D)
                 op_gds_transfer = TransferOp(
                     graph_id = transfer_graph.graph_id,
@@ -1926,6 +2309,10 @@ class GlobalCacheEngine:
                     dp_client_id = dp_client_id,
                 )
                 transfer_graph.add_transfer_op(op_disk2h)
+                # 中转 block 只有在满足下面两点时才上树（否则只是一次性 buffer）：
+                #   1. 命中落在本地 CPU（peer 命中的话，本地树接不上）；
+                #   2. 命中的块全部 ready，且命中数已经覆盖本次请求的起点，
+                #      保证插入后树里仍是连续前缀。
                 # we only insert the buffer blocks to cpu cache engine only:
                 # 1. the cpu cache engine satisfies prefix cache after insertion
                 # 2. the sequence is all ready blocks
@@ -2006,6 +2393,22 @@ class GlobalCacheEngine:
             temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
             namespace: Optional[List[str]] = None) \
                 -> Tuple[TransferOpGraph, np.ndarray, Callable, Dict, int]:
+        """PUT 主入口：把 GPU 上刚算出来的 KV 下沉到各级缓存。
+
+        流程与 get() 对称：
+            1. 对齐到 block 粒度，并由 token_mask 得到待下沉的 block 区间
+               （PUT 的 mask 必须是从 0 开始的前缀，故 block_start_idx == 0）；
+            2. 分派到 _put_impl_local / _put_impl_global 建图：
+               D2H（GPU -> CPU 内存）是最基本的一条边，SSD 与 REMOTE 都从
+               CPU 内存再往下写（H2DISK / H2REMOTE）；
+            3. 加虚拟汇点得到 task_end_op_id；
+            4. 计算 return_mask：GPU 上已缓存的头部 block（skipped_gpu_blocks）
+               不需要再搬，mask 从它之后开始；
+            5. 锁住规划期涉及的节点，打包完成 / 回滚回调。
+
+        Returns:
+            与 get() 同构的五元组
+        """
         self._check_input(token_ids, token_mask, slot_mapping)
         # ignore the last incomplete block
         aligned_length = (token_ids.shape[0] // self.tokens_per_block) * self.tokens_per_block
@@ -2050,6 +2453,8 @@ class GlobalCacheEngine:
             plan.finished_ops_ids,
             dp_client_id,
         )
+        # return_mask 要从 skipped_gpu_blocks 之后开始：前面那些 GPU 上已经有了，
+        # 不算本次搬运的成果。
         return_mask = np.zeros_like(token_mask, dtype=np.bool_)
         mask_lo = (block_start_idx + plan.skipped_gpu_blocks) * self.tokens_per_block
         mask_hi = (block_start_idx + plan.skipped_gpu_blocks
@@ -2080,6 +2485,23 @@ class GlobalCacheEngine:
 
         return transfer_graph, return_mask, callback, op_callback_dict, task_end_op_id
 
+    # ------------------------------------------------------------------
+    # 全局 PUT 路径：GPU -> CPU 内存 -> SSD -> REMOTE 逐级下沉
+    #
+    # 决策思路（对照下面的 transfer pattern 图）：
+    #   1. 三级各做一次前缀匹配，已经在缓存里的部分不需要重复写：
+    #        CPU 已缓存 num_skipped_blocks 个 -> 这些 GPU block 直接跳过（D2H 只搬剩余部分）
+    #        SSD 已缓存的更多 -> H2DISK 只写 fragment2（SSD 比 CPU 多出的那段）
+    #        REMOTE 已缓存 -> H2REMOTE 只写 fragment3
+    #   2. 建图：D2H 是源头；H2DISK / H2REMOTE 都挂在 D2H 之后（add_dependency），
+    #      因为写 SSD / 远端的数据来源正是刚落到 CPU 内存的那些 block；
+    #   3. 每级都先把目标节点 insert 上树（is_ready=False），由对应 op 的回调
+    #      置 ready —— 与 GET 路径完全对称；
+    #   4. mooncake 远端启用时改为"延迟上树"（defer_put_commit）：规划期完全不
+    #      insert，只登记 DeferredCacheInsert，等图完成后再统一提交。
+    #      额外地，PUT 的源地址必须是本进程注册的 host buffer，所以此时要用
+    #      match_local 重新匹配（不能选到 peer 节点上）。
+    # ------------------------------------------------------------------
     def _put_impl_global(self,
             request_id: int,
             sequence_meta: SequenceMeta,
@@ -2168,6 +2590,7 @@ class GlobalCacheEngine:
                 and fragment3_num_blocks == 0):
             return self._empty_put_return(request_id)
 
+        # GPU 上已缓存的头部（CPU 已命中部分）不必重复下沉，从 num_skipped_blocks 之后开始
         fragment12_gpu_blocks = gpu_block_ids[num_skipped_blocks:]
 
         fragment12_cpu_blocks = self.cpu_cache_engine.take(
@@ -2315,6 +2738,7 @@ class GlobalCacheEngine:
                 mooncake_store_block_hashes = mooncake_block_hashes,
             )
             transfer_graph.add_transfer_op(op_h2remote)
+            # 写远端的数据源就是刚落到 CPU 内存的 block，故必须排在 D2H 之后
             if op_d2h is not None:
                 transfer_graph.add_dependency(op_h2remote.op_id, op_d2h.op_id)
 
@@ -2402,6 +2826,9 @@ class GlobalCacheEngine:
                 deferred_inserts=deferred_inserts,
             )
 
+        # 非延迟路径：规划期就把三级的目标节点 insert 上树（is_ready=False），
+        # 并把 op_id -> (device, node, len) 登记进 op_node_to_ready，
+        # 由各 op 的完成回调置 ready（_op_callback）。
         assert op_d2h is not None
         cpu_node_to_unlock = self.cpu_cache_engine.insert(
             sequence_meta,
@@ -2485,6 +2912,13 @@ class GlobalCacheEngine:
             swa_slots_to_free=swa_slots_to_free,
         )
 
+    # ------------------------------------------------------------------
+    # 本地 PUT 路径：GPU -> CPU 内存 -> SSD 两级下沉（不写远端）
+    #
+    # 与 _put_impl_global 的区别：没有 fragment3 / H2REMOTE，也没有
+    # defer_put_commit 延迟上树分支 —— 一律在规划期 insert、回调置 ready。
+    # 切分逻辑相同：CPU 已缓存的跳过，SSD 比 CPU 多出的那段才写 SSD。
+    # ------------------------------------------------------------------
     def _put_impl_local(self,
             request_id: int,
             sequence_meta: SequenceMeta,
@@ -2700,6 +3134,8 @@ class GlobalCacheEngine:
             swa_slots_to_free=swa_slots_to_free,
         )
 
+    # 判断"当前匹配是否正好停在某个完整节点的边界上" —— 只有落在这种节点上，
+    # 才能安全地把 SWA 快照槽挂上去（否则节点会分裂，挂载就错位了）
     @staticmethod
     def _matched_boundary_node(current_match, matched_blocks: int):
         """Return the matched node only when ``matched_blocks`` ends on it."""
@@ -2717,6 +3153,7 @@ class GlobalCacheEngine:
         if pending.swa_slot >= 0:
             engine._free_swa_slot(pending.swa_slot)
 
+    # 丢弃一条延迟上树记录：block 还没交给树，所有权仍归本次请求，可以整体回收
     def _discard_deferred_insert(
             self, engine, pending: DeferredCacheInsert,
             physical_blocks: np.ndarray) -> None:
@@ -2735,6 +3172,8 @@ class GlobalCacheEngine:
         engine.index.set_swa(node, int(pending.swa_slot))
         engine._drain_unmounted_swa_slots()
 
+    # 上报"真正挂到树上的远端 block 数"。预取任务的 return_mask 必须用它来收敛：
+    # 传输成功不代表树上看得见（可能被并发写入抢先、或插入被拒绝）。
     @staticmethod
     def _record_deferred_publish(
             pending: DeferredCacheInsert,
@@ -2750,6 +3189,26 @@ class GlobalCacheEngine:
         publish_result.record(
             published_remote, reason=reason, failed=failed)
 
+    # ------------------------------------------------------------------
+    # 【延迟上树】—— 本文件最需要讲清楚的一处设计
+    #
+    # 为什么传输完成前不能把 block 挂到 radix tree 上？
+    #   1. 远端（mooncake）读可能**部分失败**：整批 block 里只有前面一段真的
+    #      读到手。规划时并不知道能成功多少，一旦提前上树，后续请求就会
+    #      "命中"到根本没数据的 block，读到脏 KV —— 这是不可恢复的正确性问题。
+    #   2. 从规划到完成这段时间内，树的状态可能已经被别的并发请求改变：
+    #      别人可能已经把这段前缀写进去了（我们成了冗余），也可能正在写
+    #      （树上存在未 ready 的节点，我们不能越过它去接一段数据）。
+    #   3. 因此正确的顺序是：先搬，搬完再重新 match 一次，只把"当前树上真正
+    #      缺失、且确实搬成功"的那段连续前缀插进去，插完立刻在同一把锁内
+    #      set_ready。整段 rematch + insert + set_ready 是一个原子事务。
+    #
+    # 对比：非远端路径（本地 / SSD）在规划期就 insert(is_ready=False)，
+    # 因为那些路径的成功是可预期的、由 op 完成回调保证。
+    #
+    # 本方法的返回值是被挂载的节点（或 None），并会通过 publish_result
+    # 回写"真正上树了多少个远端 block"，供预取任务收敛 return_mask。
+    # ------------------------------------------------------------------
     def _commit_deferred_insert(self, pending: DeferredCacheInsert):
         """Fresh-rematch and atomically publish one valid staging prefix.
 
@@ -2776,9 +3235,13 @@ class GlobalCacheEngine:
                 pending, pending.remote_start_block, "invalid_range", failed=True)
             return None
 
+        # 只有远端（mooncake）读才带 load_result：它决定了"搬成功了多少"。
+        # 没有它就说明是 PUT 暂存 —— 整段都算成功。
         if pending.load_result is None:
             publish_end = pending.requested_end_block
         else:
+            # 关键：取最长**连续**成功前缀，而不是成功总数 ——
+            # 中间断了一个 block，后面的内容在语义上就是不可用的
             successful_remote = pending.load_result.successful_prefix(remote_blocks)
             publish_end = pending.remote_start_block + successful_remote
 
@@ -2800,6 +3263,7 @@ class GlobalCacheEngine:
                 engine._free_swa_slot(pending.swa_slot)
                 pending = replace(pending, swa_slot=-1)
 
+        # 提交前必须重新匹配一次：规划到完成这段时间内树可能已被并发改写
         # Hierarchical engines must rematch their local tree. match() may choose
         # a distributed peer node, which is not a valid insertion anchor here.
         match_local = getattr(engine, "match_local", None)
@@ -2818,6 +3282,11 @@ class GlobalCacheEngine:
         current_blocks = int(current_match.num_matched_blocks)
         ready_blocks = int(current_match.num_ready_matched_blocks)
 
+        # 两种"放弃"的情形：
+        #   a) 树上存在别人正在写的未 ready 节点（current != ready）——
+        #      我们不能借道它的未就绪数据去接自己的块；
+        #   b) 树已经比我们这次的起点更长了（规划已过期）。
+        # 这两种情况下暂存 block 仍完全属于本次请求，可以安全回收。
         # Never attach below, or mark ready through, another in-flight writer's
         # unready node. The staged allocation remains ours and is safe to recycle.
         if (current_blocks != ready_blocks
@@ -2828,6 +3297,8 @@ class GlobalCacheEngine:
             return None
 
         if current_blocks >= publish_end:
+            # 并发的请求已经把这段前缀写好了，我们搬回来的是冗余数据，
+            # 回收即可；但这次传输本身是成功的，仍要按 publish_end 上报
             engine.recycle(physical_blocks)
             boundary_node = self._matched_boundary_node(
                 current_match, pending.requested_end_block)
@@ -2854,6 +3325,8 @@ class GlobalCacheEngine:
             skipped_blocks:successful_staged_blocks]
 
         try:
+            # 依旧是 is_ready=False 上树；紧接着的 set_ready 在同一个
+            # _cache_tree_lock 临界区内完成，外部观察不到"未就绪"的中间态
             node = engine.insert(
                 pending.sequence_meta,
                 blocks_to_insert,
@@ -2894,6 +3367,7 @@ class GlobalCacheEngine:
 
         # Keep the inserted length explicit. set_ready supports split fragments,
         # while this transaction keeps rematch, insert, and readiness atomic.
+        # 到这里才算真正"发布"：节点变 ready，后续请求的前缀匹配才能命中它
         try:
             engine.set_ready(node, True, len(blocks_to_insert))
         except Exception:
@@ -2915,6 +3389,13 @@ class GlobalCacheEngine:
         self._record_deferred_publish(pending, publish_end, "ok")
         return node
 
+    # 整张图跑完后的统一收尾（由 TransferPlanHandle 调用），做三件事：
+    #   1. 提交所有延迟上树记录（_commit_deferred_insert），并单独容错 ——
+    #      一条失败不能影响其它，更不能把节点锁永久挂住；
+    #   2. 逐级解锁规划期锁住的节点，并按 ready_length 置 ready
+    #      （ready_length == 0 表示"节点是别人已 ready 的老节点"，只解锁不改状态）；
+    #   3. 回收没能上树的中转 buffer（buffer_to_free）。
+    # 注意 finally 的作用：即使提交抛异常，锁和 buffer 也必须被释放。
     @_synchronized_cache_tree
     def _transfer_callback(self,
                            node_to_unlock: Dict[DeviceType, Tuple[RadixNode, int]],
@@ -2982,6 +3463,9 @@ class GlobalCacheEngine:
                     assert self.remote_cache_engine is not None
                     self.remote_cache_engine.recycle(buffer_to_free[DeviceType.REMOTE])
 
+    # 计划被取消（图根本没提交给数据面）时的回滚路径。
+    # 与 _transfer_callback 的分工：那条是"成功收尾"，这条是"撤销"，
+    # 二者由 TransferPlanHandle 保证只会执行其中一个、且只执行一次。
     @_synchronized_cache_tree
     def _abort_transfer_plan(self,
                              node_to_unlock: Dict[DeviceType, Tuple[RadixNode, int]],
@@ -3021,6 +3505,12 @@ class GlobalCacheEngine:
 
     @_synchronized_cache_tree
     def _op_callback(self, device_type: DeviceType, node_to_ready: RadixNode, ready_length: int) -> None:
+        """单个 op 完成回调：把该 op 写入的那段节点标记为 ready。
+
+        这是"规划期上树占位 + 完成期打开可见性"这一设计的落点：
+        节点在规划时就已 insert(is_ready=False) 并加锁，只有这里把它置 ready
+        之后，后续请求的前缀匹配才可能命中它。
+        """
         if device_type == DeviceType.CPU:
             assert self.cpu_cache_engine is not None
             self.cpu_cache_engine.set_ready(node_to_ready, True, ready_length)
@@ -3038,6 +3528,14 @@ class GlobalCacheEngine:
                         is_put: bool = False,
                         gpu_matched_blocks: int = 0) \
                             -> Tuple[MatchResultAccel, MatchResultAccel]:
+        """在 CPU / SSD 两级上做前缀匹配（index_accel 版本），不查远端。
+
+        P2P 开启时走分布式引擎的 match_all / match_local：
+            GET 用 match_all（可以选中 peer 节点上的命中，matched_pos=="remote"）
+            PUT 用 match_local（只认本节点，因为写入源必须是本进程的 buffer）
+        未命中任何引擎时返回空的 MatchResultAccel（命中数为 0），
+        调用方按 num_ready_matched_blocks 判断即可。
+        """
         #from flexkv.common.debug import flexkv_logger, summarize_id_tensor
         cpu_matched_result = MatchResultAccel()
         ssd_matched_result = MatchResultAccel()
@@ -3071,6 +3569,9 @@ class GlobalCacheEngine:
         return (self.use_mooncake_store_backend
                 and device_type == DeviceType.REMOTE)
 
+    # SWA 读选源：在各 tier 的匹配结果里挑一个"最深但仍在本次请求窗口内"的
+    # SWA 快照，并据此把 Full-KV 的可用终点 block_mask_end 收紧到 usable_end。
+    # 注意 SWA 与 Full 必须同窗口，否则窗口注意力会读到错位的上下文。
     def _select_swa_read_source(
         self,
         block_mask_start: int,
@@ -3135,6 +3636,10 @@ class GlobalCacheEngine:
 
         return block_mask_start, SWAReadSource()
 
+    # 为 SWA 读建立"源 pin + 可能的 CPU 暂存槽 + H2D op"这套资源。
+    # 必须在承认 Full-KV 命中之前完成：SWA 感知的 GET 若拿不到 SWA 快照，
+    # 就整条作废（返回 None），不能只还原 Full 部分 —— 否则模型拿到的
+    # Full 与 SWA 不一致，结果就是错的。
     def _reserve_swa_read_source(
         self,
         graph: TransferOpGraph,
@@ -3270,6 +3775,11 @@ class GlobalCacheEngine:
                     temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
                     is_put: bool = False) \
                         -> Tuple[MatchResult, MatchResult]:
+        """在 CPU / SSD 两级上做前缀匹配（Python 索引版本），不查远端。
+
+        与 match_local_accel 的差别：本版本不区分 P2P（P2P 只在 accel 分支里
+        处理），直接对本节点的两个引擎各自 match。
+        """
         cpu_matched_result = MatchResult()
         ssd_matched_result = MatchResult()
         if self.cpu_cache_engine:
@@ -3285,6 +3795,12 @@ class GlobalCacheEngine:
                         temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY,
                         is_get: bool = True) \
                             -> Tuple[MatchResultAccel, MatchResultAccel, MatchResultAccel]:
+        """在 CPU / SSD / REMOTE 三级上各做一次前缀匹配（index_accel 版本）。
+
+        三级各自独立匹配，返回三个 MatchResultAccel；由调用方
+        （_get_impl_global / _put_impl_global）比较命中长度来切分 fragment。
+        远端开启 kv_sharing 时，GET 用 match_all（可跨节点）、PUT 用 match_local。
+        """
         cpu_matched_result = MatchResultAccel()
         ssd_matched_result = MatchResultAccel()
         remote_matched_result = MatchResultAccel()
@@ -3308,6 +3824,7 @@ class GlobalCacheEngine:
                   sequence_meta: SequenceMeta,
                   temp_cache_strategy: CacheStrategy = DEFAULT_CACHE_STRATEGY) \
                       -> Tuple[MatchResult, MatchResult, MatchResult]:
+        """在 CPU / SSD / REMOTE 三级上各做一次前缀匹配（Python 索引版本）。"""
         cpu_matched_result = MatchResult()
         ssd_matched_result = MatchResult()
         remote_matched_result = MatchResult()
@@ -3324,6 +3841,8 @@ class GlobalCacheEngine:
                       token_ids: np.ndarray,
                       token_mask: np.ndarray,
                       slot_mapping: np.ndarray) -> None:
+        """入参形状 / dtype 校验。slot_mapping 的长度必须等于 mask 中 True 的个数，
+        因为它采用"紧凑排列"：只为需要搬运的 token 提供槽位。"""
         assert token_ids.dtype == np.int64
         # assert token_mask.dtype == np.bool_, f"token_mask.dtype={token_mask.dtype}"
         assert slot_mapping.dtype == np.int64
@@ -3336,6 +3855,12 @@ class GlobalCacheEngine:
 
     @staticmethod
     def slot_mapping_to_block_ids(slot_mapping: np.ndarray, tokens_per_block: int) -> np.ndarray:
+        """把 GPU 的 slot_mapping 换算成 block 编号。
+
+        slot 与 block 的关系：一个 block 装 tokens_per_block 个 token，
+        所以每隔 tokens_per_block 个 slot 取一个，再除以该值即为 block id
+        （同一个 block 内所有 slot 整除后都得到同一个 id）。
+        """
         block_ids: np.ndarray = slot_mapping[::tokens_per_block] // tokens_per_block
         return block_ids
 
@@ -3347,6 +3872,11 @@ class GlobalCacheEngine:
 
     def _get_block_range(self,
                          token_mask: np.ndarray) -> Tuple[int, int]:
+        """由 token_mask 求出需要处理的 block 区间 [start, end)。
+
+        end 是"最后一个 True 所在 block + 1"，即右开区间；mask 中间的空洞
+        不额外处理（缓存命中必然是前缀，中间空洞只能重算）。
+        """
         mask_idx = np.where(token_mask)[0]
         if len(mask_idx) == 0:
             return 0, 0

@@ -50,6 +50,62 @@
 #      字段，由 enable_p2p_* / enable_3rd_remote / use_mooncake_store_backend 推导。
 #      不要在外面直接赋值，否则会被覆盖。
 #
+# 配置项速查表（按"想干什么"查，不按类查。GLOBAL: 前缀 = GLOBAL_CONFIG_FROM_ENV
+# 里的属性，对应环境变量 FLEXKV_<NAME 大写>）：
+#   【必须配，不配就跑不起来或规模不对】
+#     ModelConfig.num_layers / num_kv_heads / head_size / kv_dim / dtype
+#         模型形状。默认值全是占位（1 / bfloat16），必须由框架 adapter 显式填。
+#     ModelConfig.tp_size / pp_size / dp_size / cp_size / nnodes
+#         并行度与节点数。决定 total_gpus（worker 注册槽位数），配错表现为
+#         "等待注册超时"而不是显式的数量不匹配。
+#     RankInfo.tp_rank / pp_rank / dp_rank / node_rank / instance_id
+#         本 rank 坐标；local_rank 传 -1（默认）表示按拓扑自动推导。
+#     UserConfig.cpu_cache_gb          CPU 一级缓存容量（GB），必须 > 0。
+#     UserConfig.ssd_cache_dir         SSD 目录，';' 分隔多盘。
+#     CacheConfig.tokens_per_block     一个 block 装几个 token，默认 16。
+#
+#   【性能调优】
+#     UserConfig.ssd_cache_gb          > 0 即启用 SSD，且必须 > cpu_cache_gb。
+#     UserConfig.enable_gds / enable_nixl
+#         GPU<->SSD 直连；需编译前 export FLEXKV_ENABLE_GDS=1。
+#     UserConfig.use_hugepage_cpu_buffer / use_hugepage_tmp_buffer
+#         主 CPU 缓存 / SSD 中转缓冲改用 HugePage（失败会静默回退）。
+#     GLOBAL: use_ce_transfer_h2d / _d2h, transfer_num_cta_h2d / _d2h,
+#             ce_segment_threshold, ce_path_opt, ssd_io_opt, iouring_entries
+#         CopyEngine 与 io_uring 的吞吐旋钮。
+#     GLOBAL: enable_layerwise_transfer, layerwise_notify_mode
+#         按层传输，把传输延迟重叠进计算（代价是 DAG 膨胀成 num_layers 个节点）。
+#     GLOBAL: eviction_policy / evict_ratio / evict_start_threshold /
+#             hit_reward_seconds / slru_protected_threshold
+#         淘汰策略与水位。注意生效的是这里这份，不是 CacheConfig.eviction_policy。
+#     GLOBAL: cpu_layout_type / ssd_layout_type / remote_layout_type /
+#             gds_layout_type
+#         各级 KV 内存布局（BLOCKFIRST / LAYERFIRST…），配错只掉速、不报错。
+#
+#   【分布式 / 多实例】
+#     ModelConfig.master_host / master_ports / instance_num
+#         多节点 rendezvous 端点与实例数。
+#     CacheConfig.enable_p2p_cpu / enable_p2p_ssd / enable_3rd_remote
+#         跨节点复用对端缓存；派生出 enable_kv_sharing（与 enable_gds 互斥）。
+#     CacheConfig.local_zmq_ip / local_zmq_port / local_ip
+#     CacheConfig.redis_host / redis_port / redis_password / node_ttl_seconds
+#         KV sharing 的元数据服务（默认只监听回环，多节点必须改真实 IP）。
+#     CacheConfig.use_mooncake_store_backend + mooncake_store_config_path
+#         Mooncake Store 远端层；与 mooncake_config_path（Transfer Engine）无关。
+#     GLOBAL: instance_num / instance_id / kv_shared_across_ranks_mode
+#         MLA 跨 rank 共享时的写入模式；all_write 会把逻辑容量 ÷ 分片数。
+#
+#   【调试 / 可观测 / 稳定性】
+#     GLOBAL: enable_metrics, cpp_metrics_port(8081), py_metrics_port(8080)
+#     GLOBAL: enable_trace, trace_file_path, trace_max_file_size_mb,
+#             trace_max_files, trace_flush_interval_ms, enable_transfer_trace
+#     GLOBAL: server_client_mode, server_launch_mode, server_recv_port
+#     GLOBAL: worker_shutdown_timeout_s(600) < transfer_manager_shutdown_timeout_s(900)
+#         关停超时层级，调参时必须保持这个大小关系，否则会被中途 SIGKILL。
+#     GLOBAL: enable_mps, enable_collective_sync
+#     GLOBAL: lt_pool_initial_capacity, lease_ttl_ms, renew_lease_ms,
+#             safety_ttl_ms, rebuild_interval_ms, refresh_batch_size, idle_sleep_ms
+#
 # 建议阅读顺序：
 #   LayerGroupSpec / LayerMemberMap（异构 KV）-> ModelConfig（freeze 与派生拓扑）
 #   -> RankInfo -> SWAPoolConfig -> CacheConfig（重点看各类 enable_* 开关）
@@ -287,6 +343,9 @@ class ModelConfig:
     # ------------------------------------------------------------------
     # Multi-instance deployment
     # ------------------------------------------------------------------
+    # 中文：多实例部署时并存几个 FlexKV 实例。它把 dp_client_id 的编号空间放大
+    # instance_num 倍（dp_client_id = instance_id * dp_size + dp_rank），因此是多
+    # 实例下全局路由不撞号的前提；填小了会让不同实例的 client 在 server 侧重叠。
     instance_num: int = 1
 
     # ------------------------------------------------------------------
@@ -838,7 +897,10 @@ class SWAPoolConfig:
     def for_remote_tier(self) -> "SWAPoolConfig":
         """Derive the REMOTE-tier SWA config (same slot geometry, num_remote_slots).
 
-        REMOTE SWA slots are not pinned host memory; pin_memory is forced off."""
+        REMOTE SWA slots are not pinned host memory; pin_memory is forced off.
+
+        中文：与 for_ssd_tier 同理——REMOTE 层槽位不住在主机内存，pin_memory 强制关掉。
+        """
         return replace(self, num_slots=self.num_remote_slots, pin_memory=False)
 
     def for_cache_tier(self, device_type) -> Optional["SWAPoolConfig"]:
@@ -919,6 +981,16 @@ class CacheConfig:
       4. 单位：*_blocks 是 block 数不是字节；GB -> block 的换算见
          update_default_config_from_user_config()。
     """
+    # 中文：下面两个是"全局基准"字段：
+    #   tokens_per_block —— 一个 block 装几个 token，默认 16。它是所有容量换算的
+    #     分母基准（block_size_in_bytes = 每 token 字节 × tokens_per_block），
+    #     异构模型下必须能被每个 layer_group 的 compress_ratio 整除，否则
+    #     block_size_in_bytes_for_cache() 直接抛 ValueError。
+    #   eviction_policy —— 淘汰策略名，取值 lru / lfu / fifo / mru / slru / filo
+    #     （由 csrc/eviction_strategy.cpp 的 parse_eviction_policy 解析）。
+    #     坑：本字段目前**没有读取方**，radix tree 实际用的是
+    #     GLOBAL_CONFIG_FROM_ENV.eviction_policy（即 FLEXKV_EVICTION_POLICY，
+    #     配置文件里写 override_eviction_policy 也可）。改策略别只改这里。
     tokens_per_block: int = 16
     eviction_policy: str = "lru"
     # ==================================================================
@@ -1863,7 +1935,11 @@ class MooncakeTransferEngineConfig:
 
     @staticmethod
     def from_file(file_path: str) -> "MooncakeTransferEngineConfig":
-        """Load the config from a JSON file."""
+        """Load the config from a JSON file.
+
+        中文：读 JSON 文件后转交 from_dict() 构造。缺失字段一律用默认值兜底，
+        所以真实部署只需在文件里写 engine_ip / engine_port 等几项关键配置。
+        """
         with open(file_path) as fin:
             config = json.load(fin)
         return MooncakeTransferEngineConfig.from_dict(config)
